@@ -1,5 +1,7 @@
 # LM Studio Installer
 
+[![CI](https://github.com/22Pizzas/lmstudio-install/actions/workflows/ci.yml/badge.svg)](https://github.com/22Pizzas/lmstudio-install/actions/workflows/ci.yml)
+
 Cross-platform installers for the **LM Studio desktop app** (GUI), not the headless `llmster` daemon.
 
 Official one-liners on [lmstudio.ai/download](https://lmstudio.ai/download) (`install.sh` / `install.ps1`) install **llmster**. This repo installs the full application:

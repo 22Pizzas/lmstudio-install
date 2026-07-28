@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shell:
+    name: Linux script (shellcheck + bash -n)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: bash -n syntax check
+        run: bash -n lm-studio-install.sh
+
+      - name: ShellCheck
+        # SC2034: some flags are reserved for future/env use
+        # SC1090/1091: optional sourced files not present in CI
+        run: shellcheck -x -e SC2034,SC1090,SC1091 lm-studio-install.sh
+
+      - name: Help / usage smoke
+        run: |
+          chmod +x lm-studio-install.sh
+          ./lm-studio-install.sh --help
+
+      - name: Fetch latest version (network)
+        run: |
+          set -euo pipefail
+          final=$(curl -fsSLI -o /dev/null -w '%{url_effective}' --max-time 30 \
+            "https://lmstudio.ai/download/latest/linux/x64")
+          echo "Resolved: $final"
+          echo "$final" | grep -qE 'LM-Studio-[0-9]+\.[0-9]+\.[0-9]+'
+
+  powershell:
+    name: Windows script (PSScriptAnalyzer + smoke)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+
+      - name: Parse script AST
+        shell: pwsh
+        run: |
+          $errs = $null
+          $tokens = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            "$pwd\lm-studio-install.ps1",
+            [ref]$tokens,
+            [ref]$errs
+          )
+          if ($errs -and $errs.Count -gt 0) {
+            $errs | ForEach-Object { Write-Error $_.ToString() }
+            exit 1
+          }
+          Write-Host "Parse OK"
+
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          $results = Invoke-ScriptAnalyzer -Path .\lm-studio-install.ps1 -Severity @('Error', 'Warning')
+          if ($results) {
+            $results | Format-Table -AutoSize | Out-String | Write-Host
+            # Fail only on Error severity so style Warnings do not block merges
+            $errors = $results | Where-Object { $_.Severity -eq 'Error' }
+            if ($errors) { exit 1 }
+          } else {
+            Write-Host "No analyzer findings"
+          }
+
+      - name: Help / check / info smoke
+        shell: pwsh
+        run: |
+          .\lm-studio-install.ps1 -Help
+          .\lm-studio-install.ps1 check
+          .\lm-studio-install.ps1 info
