@@ -45,17 +45,19 @@
 #
 # REQUIREMENTS
 # -----------
-#   Minimum: curl, wget, file, sudo, od (coreutils)
-#   Optional: aria2c (faster parallel downloads)
+#   Minimum: curl, file, od (coreutils)
+#   Optional: wget (fallback downloader), aria2c (faster parallel downloads),
+#             sudo (for chrome-sandbox SUID; app may still run without it),
+#             timeout (prevents hung AppImage extract)
 #   Tested: Debian, Ubuntu, Fedora, Arch Linux
 #
 # TROUBLESHOOTING
 # ---------------
-#   Q: "Missing packages: curl wget ..." error
-#   A: Install coreutils and curl
-#      Debian/Ubuntu: sudo apt install curl wget file coreutils
-#      Fedora:        sudo dnf install curl wget file coreutils
-#      Arch:          sudo pacman -S curl wget file coreutils
+#   Q: "Missing packages: curl ..." error
+#   A: Install curl and coreutils
+#      Debian/Ubuntu: sudo apt install curl file coreutils
+#      Fedora:        sudo dnf install curl file coreutils
+#      Arch:          sudo pacman -S curl file coreutils
 #
 #   Q: "lm-studio command not found"
 #   A: ~/.local/bin not in PATH. Add to ~/.bashrc:
@@ -67,6 +69,11 @@
 #      Restore manually:
 #        rm -rf ~/.local/share/lm-studio
 #        mv ~/.local/share/lm-studio.bak ~/.local/share/lm-studio
+#
+# NOTE
+# ----
+#   Official one-liners at lmstudio.ai/install.sh install *llmster* (headless
+#   daemon), not the full desktop app. This script installs the GUI AppImage.
 #
 # ===========================================================================
 
@@ -252,12 +259,13 @@ cmd_uninstall() {
 }
 
 cmd_check() {
-    # FIX: Capture stderr separately so fetch errors surface to the user instead
+    # Capture stderr separately so fetch errors surface to the user instead
     # of being silently swallowed by 2>/dev/null.
-    local latest fetch_err
+    local latest fetch_err arch
+    arch=$(detect_architecture 2>/dev/null || echo "x64")
     fetch_err=$(mktemp)
     temp_track "$fetch_err"
-    latest=$(fetch_latest_version 2>"$fetch_err") || true
+    latest=$(fetch_latest_version "$arch" 2>"$fetch_err") || true
     if [[ -s "$fetch_err" ]]; then
         log_warn "Version fetch warning: $(cat "$fetch_err")"
     fi
@@ -291,12 +299,16 @@ check_dependencies() {
     log_info "Checking dependencies..."
     local missing=()
     local cmd
-    for cmd in curl wget file sudo od; do
+    # curl is required; wget is optional (curl can download too).
+    # sudo is only needed later for chrome-sandbox and is handled there.
+    for cmd in curl file od; do
         command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
     done
     if [[ ${#missing[@]} -gt 0 ]]; then
         log_error "Missing packages: ${missing[*]}"
-        echo "Run: sudo apt install curl wget file coreutils -y" >&2
+        echo "Debian/Ubuntu: sudo apt install curl file coreutils -y" >&2
+        echo "Fedora:        sudo dnf install curl file coreutils -y" >&2
+        echo "Arch:          sudo pacman -S curl file coreutils" >&2
         exit 1
     fi
 
@@ -305,6 +317,13 @@ check_dependencies() {
         log_info "aria2c detected — faster downloads enabled"
     else
         USE_ARIA2=false
+    fi
+
+    if ! command -v wget >/dev/null 2>&1; then
+        log_info "wget not found — using curl for downloads"
+    fi
+    if ! command -v timeout >/dev/null 2>&1; then
+        log_warn "timeout not found — AppImage extract will run without a time limit"
     fi
 }
 
@@ -328,32 +347,63 @@ validate_version() {
     fi
 }
 
+# fetch_latest_version() — Resolve the current release by following the official
+# "latest" redirect. Scraping the download HTML is unreliable (many unrelated
+# version-like strings appear on the page).
 fetch_latest_version() {
+    local arch="${1:-x64}"
+    local final=""
+    local url="https://lmstudio.ai/download/latest/linux/${arch}"
+
+    # Prefer the redirect target: .../LM-Studio-0.4.20-1-x64.AppImage
+    final=$(curl -fsSLI -o /dev/null -w '%{url_effective}' --max-time 15 "$url" 2>/dev/null) || true
+    if [[ -n "$final" && "$final" =~ LM-Studio-([0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?)- ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    # Fallback: scrape page for LM-Studio-X.Y.Z filenames only
     local page
-    page=$(curl -fsSL --max-time 8 "https://lmstudio.ai/download" 2>/dev/null) || {
+    page=$(curl -fsSL --max-time 12 "https://lmstudio.ai/download" 2>/dev/null) || {
         log_warn "Could not reach lmstudio.ai — check your network connection." >&2
         return 0
     }
-    # FIX: grep -oP is not POSIX; use grep -oE for broader compatibility.
-    # Pattern unchanged — X.Y.Z or X.Y.Z-N.
-    echo "$page" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?' | head -1 || true
+    local ver
+    ver=$(echo "$page" | grep -oE 'LM-Studio-[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?' | head -1 | sed 's/^LM-Studio-//') || true
+    if [[ -n "$ver" ]]; then
+        echo "$ver"
+        return 0
+    fi
+
+    # Last resort: first 0.x.y token (LM Studio desktop is currently 0.x)
+    echo "$page" | grep -oE '0\.[0-9]+\.[0-9]+(-[0-9]+)?' | head -1 || true
 }
 
 prompt_version() {
+    local arch="${1:-x64}"
     echo "" >&2
-    local latest; latest=$(fetch_latest_version 2>/dev/null)
+    local latest; latest=$(fetch_latest_version "$arch" 2>/dev/null)
     if [[ -n "$latest" ]]; then
         log_info "Latest detected version: ${latest}"
         if $OPT_YES; then
             echo "$latest"
             return
         fi
-    else
-        log_warn "Could not auto-detect latest version."
-        log_info "Check https://lmstudio.ai/download for the current release."
+        # Default to latest when the user presses Enter
+        echo "Press Enter to install ${latest}, or type another version (e.g. 0.4.8-1):" >&2
+        read -r version
+        if [[ -z "$version" ]]; then
+            echo "$latest"
+            return
+        fi
+        validate_version "$version" || exit 1
+        echo "$version"
+        return
     fi
 
-    echo "Enter the exact version to install (e.g. 0.4.8-1):" >&2
+    log_warn "Could not auto-detect latest version."
+    log_info "Check https://lmstudio.ai/download for the current release."
+    echo "Enter the exact version to install (e.g. 0.4.20-1):" >&2
     read -r version
     [[ -z "$version" ]] && { log_error "No version entered."; exit 1; }
     validate_version "$version" || exit 1
@@ -447,6 +497,49 @@ validate_download() {
     log_success "Download validated (ELF magic OK, size ${actual_size} bytes)"
 }
 
+# download_file() — Shared downloader: aria2c → wget → curl
+download_file() {
+    local url="$1"
+    local dest="$2"
+    local downloaded=false
+
+    if $USE_ARIA2; then
+        if aria2c -x 8 -s 8 --allow-overwrite=true \
+            -d "$(dirname "$dest")" -o "$(basename "$dest")" "$url" >&2; then
+            downloaded=true
+            log_success "Downloaded with aria2c"
+        else
+            log_warn "aria2c failed, trying next downloader..."
+        fi
+    fi
+
+    if ! $downloaded && command -v wget >/dev/null 2>&1; then
+        if $OPT_QUIET; then
+            wget -q -O "$dest" "$url" >&2 && downloaded=true
+        else
+            wget --show-progress -O "$dest" "$url" >&2 && downloaded=true
+        fi
+        if $downloaded; then
+            log_success "Downloaded with wget"
+        else
+            log_warn "wget failed, trying curl..."
+        fi
+    fi
+
+    if ! $downloaded; then
+        if $OPT_QUIET; then
+            curl -fsSL --retry 3 --retry-delay 2 -o "$dest" "$url" || {
+                log_error "Download failed."; return 1
+            }
+        else
+            curl -fL --retry 3 --retry-delay 2 --progress-bar -o "$dest" "$url" || {
+                log_error "Download failed."; return 1
+            }
+        fi
+        log_success "Downloaded with curl"
+    fi
+}
+
 download_appimage() {
     local version="$1"
     local arch="$2"
@@ -459,23 +552,7 @@ download_appimage() {
     local tmp; tmp=$(mktemp)
     temp_track "$tmp"
 
-    local downloaded=false
-
-    if $USE_ARIA2; then
-        if aria2c -x 8 -s 8 --allow-overwrite=true \
-            -d "$(dirname "$tmp")" -o "$(basename "$tmp")" "$url" >&2; then
-            downloaded=true
-            log_success "Downloaded with aria2c"
-        else
-            log_warn "aria2c failed, falling back to wget..."
-        fi
-    fi
-
-    if ! $downloaded; then
-        wget --show-progress -O "$tmp" "$url" >&2 || { log_error "Download failed."; return 1; }
-        log_success "Downloaded with wget"
-    fi
-
+    download_file "$url" "$tmp" || return 1
     validate_download "$tmp" || return 1
 
     local appimage_out; appimage_out="$(dirname "$tmp")/${appimage_name}"
@@ -505,10 +582,16 @@ extract_and_install() {
     local extract_tmp; extract_tmp=$(mktemp -d)
     temp_track "$extract_tmp"
 
-    # FIX: Wrap extraction in a timeout so a hung AppImage doesn't block forever.
-    if ! timeout 300 bash -c "cd '$extract_tmp' && '$appimage_file' --appimage-extract" \
-            >/dev/null 2>&1; then
-        log_error "AppImage extraction failed or timed out (5 min limit)."
+    # Wrap extraction in timeout when available so a hung AppImage doesn't block forever.
+    local extract_rc=0
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 300 bash -c "cd '$extract_tmp' && '$appimage_file' --appimage-extract" \
+            >/dev/null 2>&1 || extract_rc=$?
+    else
+        (cd "$extract_tmp" && "$appimage_file" --appimage-extract) >/dev/null 2>&1 || extract_rc=$?
+    fi
+    if [[ $extract_rc -ne 0 ]]; then
+        log_error "AppImage extraction failed or timed out."
         return 1
     fi
 
@@ -530,18 +613,28 @@ extract_and_install() {
     # to an unexpected binary.
     local sandbox="${INSTALL_DIR}/chrome-sandbox"
     if [[ -f "$sandbox" ]]; then
-        log_info "Configuring chrome-sandbox (requires sudo)..."
-        local inode_before inode_after
-        inode_before=$(stat -c '%i' "$sandbox")
-        sudo chown root:root "$sandbox"
-        inode_after=$(stat -c '%i' "$sandbox")
-        if [[ "$inode_before" != "$inode_after" ]]; then
-            log_error "chrome-sandbox inode changed during chown — aborting SUID setup."
-            log_error "The installation directory may have been tampered with."
-            return 1
+        if command -v sudo >/dev/null 2>&1; then
+            log_info "Configuring chrome-sandbox (requires sudo)..."
+            local inode_before inode_after
+            inode_before=$(stat -c '%i' "$sandbox" 2>/dev/null || stat -f '%i' "$sandbox")
+            if sudo chown root:root "$sandbox" 2>/dev/null; then
+                inode_after=$(stat -c '%i' "$sandbox" 2>/dev/null || stat -f '%i' "$sandbox")
+                if [[ "$inode_before" != "$inode_after" ]]; then
+                    log_error "chrome-sandbox inode changed during chown — aborting SUID setup."
+                    log_error "The installation directory may have been tampered with."
+                    return 1
+                fi
+                sudo chmod 4755 "$sandbox"
+                log_success "chrome-sandbox configured (SUID root)"
+            else
+                log_warn "Could not configure chrome-sandbox (sudo denied or failed)."
+                log_warn "You may need: sudo chown root:root '$sandbox' && sudo chmod 4755 '$sandbox'"
+                log_warn "Or launch with --no-sandbox if your environment allows it."
+            fi
+        else
+            log_warn "sudo not found — skipping chrome-sandbox SUID setup."
+            log_warn "LM Studio may require: chrome-sandbox owned by root with mode 4755"
         fi
-        sudo chmod 4755 "$sandbox"
-        log_success "chrome-sandbox configured (SUID root)"
     fi
 
     echo "$version" > "$VERSION_FILE"
@@ -640,7 +733,7 @@ main() {
         validate_version "$OPT_VERSION" || exit 1
         version="$OPT_VERSION"
     else
-        version=$(prompt_version)
+        version=$(prompt_version "$arch")
     fi
     log_success "Target version: $version"
 

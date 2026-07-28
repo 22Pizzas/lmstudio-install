@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: LM Studio (upstream app)
+    url: https://lmstudio.ai
+    about: Issues with the LM Studio application itself (not these install scripts)
+  - name: LM Studio download page
+    url: https://lmstudio.ai/download
+    about: Official desktop downloads and release notes

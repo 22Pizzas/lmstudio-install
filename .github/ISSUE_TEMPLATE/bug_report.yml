@@ -1,0 +1,78 @@
+name: Bug report
+description: Report an install, upgrade, check, or uninstall failure
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Please fill in as much detail as you can.
+        For security issues, use the private [security advisory](https://github.com/22Pizzas/lmstudio-install/security/advisories/new) flow instead.
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS / distro and version
+      description: e.g. Ubuntu 24.04, Windows 11 23H2
+      placeholder: Ubuntu 24.04 x86_64
+    validations:
+      required: true
+  - type: dropdown
+    id: script
+    attributes:
+      label: Script
+      options:
+        - lm-studio-install.sh
+        - lm-studio-install.ps1
+        - Both / unsure
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Target LM Studio version (if known)
+      placeholder: 0.4.20-1 or latest
+  - type: textarea
+    id: command
+    attributes:
+      label: Command you ran
+      description: Exact command line (redact secrets if any)
+      placeholder: ./lm-studio-install.sh -v 0.4.20-1 -y
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include exit codes and full error output when possible
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / terminal output
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues for duplicates
+          required: true
+        - label: I am not reporting an LM Studio app bug unrelated to these installers
+          required: false
