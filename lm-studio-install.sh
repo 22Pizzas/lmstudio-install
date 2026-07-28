@@ -141,7 +141,9 @@ cleanup() {
     local exit_code=$?
     local f
     for f in "${TEMP_FILES[@]}"; do
-        [[ -n "$f" ]] && rm -rf "$f" 2>/dev/null || true
+        if [[ -n "$f" ]]; then
+            rm -rf "$f" 2>/dev/null || true
+        fi
     done
 
     if [[ $exit_code -ne 0 && "$BACKUP_CREATED" == true && -d "$BACKUP_DIR" ]]; then
@@ -252,8 +254,9 @@ cmd_uninstall() {
     rm -rf "${INSTALL_DIR:?}"
     rm -f "${BIN_DIR}/lm-studio" "${BIN_DIR}/lms"
     rm -f "${DESKTOP_DIR}/lm-studio.desktop"
-    command -v update-desktop-database >/dev/null 2>&1 && \
+    if command -v update-desktop-database >/dev/null 2>&1; then
         update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+    fi
 
     log_success "LM Studio uninstalled."
 }
@@ -653,7 +656,7 @@ create_symlinks() {
     fi
 
     if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
-        log_warn "~/.local/bin is not in your PATH."
+        log_warn "${BIN_DIR} is not in your PATH."
         echo "  Fix permanently:" >&2
         echo "    echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc && source ~/.bashrc" >&2
     fi
@@ -686,8 +689,9 @@ Keywords=AI;LLM;Machine Learning;
 EOF
 
     chmod +x "${DESKTOP_DIR}/lm-studio.desktop"
-    command -v update-desktop-database >/dev/null 2>&1 && \
+    if command -v update-desktop-database >/dev/null 2>&1; then
         update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+    fi
     log_success "Desktop entry created"
 }
 
