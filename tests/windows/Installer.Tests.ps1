@@ -282,3 +282,69 @@ Describe 'Windows state and process reliability' {
         Should -Invoke Remove-Item -ParameterFilter { $Recurse } -Times 0 -Exactly
     }
 }
+
+Describe 'Windows update semantics' {
+    BeforeAll {
+        $script:ProjectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+        $script:InstallerUnderTest = Join-Path $script:ProjectRoot 'lm-studio-install.ps1'
+        $env:LMS_INSTALLER_SOURCE_ONLY = '1'
+        . $script:InstallerUnderTest
+        $script:QuietOutput = $true
+    }
+
+    AfterAll {
+        Remove-Item Env:LMS_INSTALLER_SOURCE_ONLY -ErrorAction SilentlyContinue
+    }
+
+    It 'ignores unrelated version tokens in download content' {
+        Get-VersionFromArtifactText '<html>Unrelated product 0.9.9</html>' |
+            Should -BeNullOrEmpty
+    }
+
+    It 'parses only an LM Studio artifact version' {
+        Get-VersionFromArtifactText 'href="LM-Studio-0.4.21-2-x64.exe"' |
+            Should -Be '0.4.21-2'
+    }
+
+    It 'returns no latest version when redirect and page contain only unrelated tokens' {
+        Mock Resolve-LatestRedirect { 'https://example.test/other-product-0.9.9.exe' }
+        Mock Invoke-WebRequest { [pscustomobject]@{ Content = '<html>Other product 0.9.9</html>' } }
+
+        Get-LatestVersion -Arch x64 | Should -BeNullOrEmpty
+    }
+
+    It 'compares numeric build versions' {
+        (ConvertTo-VersionObject '0.4.21-10').CompareTo((ConvertTo-VersionObject '0.4.21-2')) |
+            Should -BeGreaterThan 0
+    }
+
+    It 'reports an installed build newer than latest as ahead' {
+        Mock Get-WindowsArchToken { 'x64' }
+        Mock Get-LatestVersion { '0.4.21-2' }
+        Mock Get-LmStudioState {
+            [pscustomobject]@{ IsInstalled = $true; Path = 'C:\LM Studio'; Version = '0.4.22-1'; CachedVersion = $null }
+        }
+
+        Show-Check 6>&1 | Out-String | Should -Match 'newer than the current public release'
+    }
+
+    It 'reports an available update only when installed is older' {
+        Mock Get-WindowsArchToken { 'x64' }
+        Mock Get-LatestVersion { '0.4.21-2' }
+        Mock Get-LmStudioState {
+            [pscustomobject]@{ IsInstalled = $true; Path = 'C:\LM Studio'; Version = '0.4.20-9'; CachedVersion = $null }
+        }
+
+        Show-Check 6>&1 | Out-String | Should -Match 'update is available'
+    }
+
+    It 'reports up to date only when versions are equal' {
+        Mock Get-WindowsArchToken { 'x64' }
+        Mock Get-LatestVersion { '0.4.21-2' }
+        Mock Get-LmStudioState {
+            [pscustomobject]@{ IsInstalled = $true; Path = 'C:\LM Studio'; Version = '0.4.21-2'; CachedVersion = $null }
+        }
+
+        Show-Check 6>&1 | Out-String | Should -Match 'up to date'
+    }
+}

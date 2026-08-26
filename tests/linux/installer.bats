@@ -323,3 +323,70 @@ EOF
     [ "$status" -eq 73 ]
     [ ! -e "$TEST_ROOT/chmod-called" ]
 }
+
+@test "unknown arguments fail" {
+    run env LMS_INSTALLER_SOURCE_ONLY=0 "$PROJECT_ROOT/lm-studio-install.sh" --not-a-real-option
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Unknown argument"* ]]
+}
+
+@test "missing version option value fails" {
+    run bash -c 'source "$1"; trap - EXIT INT TERM; parse_args -v' _ \
+        "$PROJECT_ROOT/lm-studio-install.sh"
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"requires VERSION"* ]]
+}
+
+@test "check rejects unsupported architecture" {
+    run bash -c '
+        source "$1"; trap - EXIT INT TERM
+        detect_architecture() { return 1; }
+        fetch_latest_version() { echo 9.9.9; }
+        cmd_check
+    ' _ "$PROJECT_ROOT/lm-studio-install.sh"
+
+    [ "$status" -eq 1 ]
+}
+
+@test "latest lookup ignores unrelated version tokens" {
+    run bash -c '
+        source "$1"; trap - EXIT INT TERM
+        curl() {
+            if [[ "$*" == *-fsSLI* ]]; then return 22; fi
+            printf "<html><body>Unrelated product 0.9.9</body></html>"
+        }
+        fetch_latest_version x64
+    ' _ "$PROJECT_ROOT/lm-studio-install.sh"
+
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "compares numeric build versions" {
+    run bash -c '
+        source "$1"; trap - EXIT INT TERM
+        declare -F compare_versions >/dev/null || exit 99
+        compare_versions 0.4.21-10 0.4.21-2
+        compare_versions 0.4.20-9 0.4.21-2
+        compare_versions 0.4.21-2 0.4.21-2
+    ' _ "$PROJECT_ROOT/lm-studio-install.sh"
+
+    [ "$status" -eq 0 ]
+    [ "$output" = $'1\n-1\n0' ]
+}
+
+@test "check reports an installed build newer than public release" {
+    make_managed_install 0.4.22-1
+
+    run bash -c '
+        source "$1"; trap - EXIT INT TERM
+        detect_architecture() { echo x64; }
+        fetch_latest_version() { echo 0.4.21-2; }
+        cmd_check
+    ' _ "$PROJECT_ROOT/lm-studio-install.sh"
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"newer than the current public release"* ]]
+}

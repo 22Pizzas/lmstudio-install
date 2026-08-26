@@ -191,6 +191,7 @@ log_success() { $OPT_QUIET || echo -e "${GREEN}✓${NC} $*" >&2; }
 # ARGUMENT PARSING & HELP
 # ===============================
 usage() {
+    local rc="${1:-0}"
     cat >&2 <<EOF
 Usage: $(basename "$0") [OPTIONS] [SUBCOMMAND]
 
@@ -209,7 +210,7 @@ Options:
 Environment:
   LMS_INSTALL_DIR     Override installation directory (default: ~/.local/share/lm-studio)
 EOF
-    exit 0
+    exit "$rc"
 }
 
 # FIX: Removed the entire embedded lmstudio-beta-updater.sh that was pasted
@@ -220,16 +221,20 @@ parse_args() {
             uninstall|info|check)
                 OPT_SUBCOMMAND="$1" ;;
             -v|--ver)
-                shift; OPT_VERSION="${1:-}" ;;
+                if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
+                    log_error "$1 requires VERSION"
+                    usage 1
+                fi
+                shift; OPT_VERSION="$1" ;;
             -y|--yes)
                 OPT_YES=true ;;
             -q|--quiet)
                 OPT_QUIET=true ;;
             -h|--help)
-                usage ;;
+                usage 0 ;;
             *)
                 log_error "Unknown argument: $1"
-                usage ;;
+                usage 1 ;;
         esac
         shift
     done
@@ -410,7 +415,7 @@ cmd_check() {
     # Capture stderr separately so fetch errors surface to the user instead
     # of being silently swallowed by 2>/dev/null.
     local latest fetch_err arch
-    arch=$(detect_architecture 2>/dev/null || echo "x64")
+    arch=$(detect_architecture) || return 1
     fetch_err=$(mktemp)
     temp_track "$fetch_err"
     latest=$(fetch_latest_version "$arch" 2>"$fetch_err") || true
@@ -429,10 +434,17 @@ cmd_check() {
     fi
     if [[ -n "$latest" ]]; then
         echo -e "  Latest:    ${GREEN}${latest}${NC}"
-        if [[ -n "$installed" && "$installed" != "$latest" ]]; then
-            echo -e "\n  ${YELLOW}An update may be available.${NC} Run without 'check' to upgrade."
-        elif [[ "$installed" == "$latest" ]]; then
-            echo -e "\n  ${GREEN}You are up to date.${NC}"
+        if [[ -n "$installed" ]]; then
+            local comparison
+            if ! comparison=$(compare_versions "$installed" "$latest"); then
+                log_warn "Could not compare installed version '$installed' with '$latest'."
+            else
+                case "$comparison" in
+                    -1) echo -e "\n  ${YELLOW}An update is available.${NC} Run without 'check' to upgrade." ;;
+                     0) echo -e "\n  ${GREEN}You are up to date.${NC}" ;;
+                     1) echo -e "\n  ${CYAN}Your installed build is newer than the current public release.${NC}" ;;
+                esac
+            fi
         fi
     else
         echo -e "  Latest:    ${YELLOW}(could not fetch — check https://lmstudio.ai/download)${NC}"
@@ -495,6 +507,33 @@ validate_version() {
     fi
 }
 
+compare_versions() {
+    local left="$1" right="$2" lbase lbuild rbase rbuild
+    lbase="${left%%-*}"
+    lbuild="${left#*-}"
+    [[ "$lbuild" == "$left" ]] && lbuild=0
+    rbase="${right%%-*}"
+    rbuild="${right#*-}"
+    [[ "$rbuild" == "$right" ]] && rbuild=0
+
+    local IFS=.
+    local la lb lc ra rb rc value
+    read -r la lb lc <<< "$lbase"
+    read -r ra rb rc <<< "$rbase"
+    for value in "$la" "$lb" "$lc" "$lbuild" "$ra" "$rb" "$rc" "$rbuild"; do
+        [[ "$value" =~ ^[0-9]+$ ]] || return 2
+    done
+
+    la=$((10#$la)); lb=$((10#$lb)); lc=$((10#$lc)); lbuild=$((10#$lbuild))
+    ra=$((10#$ra)); rb=$((10#$rb)); rc=$((10#$rc)); rbuild=$((10#$rbuild))
+    if (( la != ra )); then (( la < ra )) && echo -1 || echo 1
+    elif (( lb != rb )); then (( lb < rb )) && echo -1 || echo 1
+    elif (( lc != rc )); then (( lc < rc )) && echo -1 || echo 1
+    elif (( lbuild != rbuild )); then (( lbuild < rbuild )) && echo -1 || echo 1
+    else echo 0
+    fi
+}
+
 # fetch_latest_version() — Resolve the current release by following the official
 # "latest" redirect. Scraping the download HTML is unreliable (many unrelated
 # version-like strings appear on the page).
@@ -523,8 +562,7 @@ fetch_latest_version() {
         return 0
     fi
 
-    # Last resort: first 0.x.y token (LM Studio desktop is currently 0.x)
-    echo "$page" | grep -oE '0\.[0-9]+\.[0-9]+(-[0-9]+)?' | head -1 || true
+    return 0
 }
 
 prompt_version() {
@@ -962,9 +1000,8 @@ main() {
 # ===========================================================================
 # EXIT CODES
 # ----------
-#   0  Success
+#   0  Success (including user cancellation)
 #   1  General error (missing deps, invalid version, download failure, etc.)
-#   2  User cancelled
 # ===========================================================================
 if [[ "${LMS_INSTALLER_SOURCE_ONLY:-0}" != "1" ]]; then
     main "$@"

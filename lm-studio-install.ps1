@@ -63,6 +63,9 @@ $script:LatestUrlBase = 'https://lmstudio.ai/download/latest/win32'
 $script:InstallerUrlBase = 'https://installers.lmstudio.ai/win32'
 $script:NonInteractive = [bool]$Yes
 $script:QuietOutput = [bool]$Quiet
+$script:RequestedSubcommand = [string]$Subcommand
+$script:RequestedVersion = [string]$Version
+$script:HelpRequested = [bool]$Help
 
 # Common install locations used by Electron / NSIS builds
 $script:KnownInstallRoots = @(
@@ -137,27 +140,33 @@ function Test-VersionFormat {
     return [bool]($Ver -match '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$')
 }
 
+function Get-VersionFromArtifactText {
+    param([string]$Text)
+    if ($Text -match 'LM-Studio-([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9]+)?)-') {
+        return $Matches[1]
+    }
+    return $null
+}
+
+function Resolve-LatestRedirect {
+    param([Parameter(Mandatory)][string]$Url)
+    $request = [System.Net.HttpWebRequest]::Create($Url)
+    $request.Method = 'HEAD'
+    $request.AllowAutoRedirect = $true
+    $request.Timeout = 15000
+    $response = $request.GetResponse()
+    try { return $response.ResponseUri.AbsoluteUri }
+    finally { $response.Close() }
+}
+
 function Get-LatestVersion {
     param([string]$Arch = (Get-WindowsArchToken))
 
     $url = "$script:LatestUrlBase/$Arch"
     try {
-        # Follow redirects; final URL contains the versioned filename.
-        $req = [System.Net.HttpWebRequest]::Create($url)
-        $req.Method = 'HEAD'
-        $req.AllowAutoRedirect = $true
-        $req.Timeout = 15000
-        $resp = $req.GetResponse()
-        try {
-            $final = $resp.ResponseUri.AbsoluteUri
-        }
-        finally {
-            $resp.Close()
-        }
-
-        if ($final -match 'LM-Studio-([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9]+)?)-') {
-            return $Matches[1]
-        }
+        $final = Resolve-LatestRedirect -Url $url
+        $redirectVersion = Get-VersionFromArtifactText -Text $final
+        if ($redirectVersion) { return $redirectVersion }
     }
     catch {
         Write-WarnMsg "Could not resolve latest version via redirect: $($_.Exception.Message)"
@@ -166,10 +175,11 @@ function Get-LatestVersion {
     # Fallback: scrape download page for LM-Studio-X.Y.Z tokens only
     try {
         $page = Invoke-WebRequest -Uri 'https://lmstudio.ai/download' -UseBasicParsing -TimeoutSec 15
-        $m = [regex]::Match($page.Content, 'LM-Studio-([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9]+)?)')
-        if ($m.Success) { return $m.Groups[1].Value }
-        $m2 = [regex]::Match($page.Content, '0\.[0-9]+\.[0-9]+(?:-[0-9]+)?')
-        if ($m2.Success) { return $m2.Value }
+        $pageText = if ($page.Content -is [byte[]]) {
+            [System.Text.Encoding]::UTF8.GetString($page.Content)
+        }
+        else { [string]$page.Content }
+        return Get-VersionFromArtifactText -Text $pageText
     }
     catch {
         Write-WarnMsg "Could not reach lmstudio.ai - check your network connection."
@@ -193,6 +203,15 @@ function ConvertTo-LmStudioVersion {
         return $Matches[1]
     }
     return $null
+}
+
+function ConvertTo-VersionObject {
+    param([Parameter(Mandatory)][string]$Value)
+    $normalized = ConvertTo-LmStudioVersion -Value $Value
+    if (-not $normalized) { throw "Invalid LM Studio version: $Value" }
+    $parts = $normalized -split '-', 2
+    $build = if ($parts.Count -eq 2) { [int]$parts[1] } else { 0 }
+    return [version]"$($parts[0]).$build"
 }
 
 function Get-VersionFromInfo {
@@ -629,13 +648,20 @@ function Show-Check {
     }
     if ($latest) {
         Write-Host "  Latest:    $latest" -ForegroundColor Green
-        if (-not $pathOnly -and $installed -and $installed -eq $latest) {
+        if (-not $pathOnly -and $installed) {
+            $comparison = (ConvertTo-VersionObject -Value $installed).CompareTo(
+                (ConvertTo-VersionObject -Value $latest)
+            )
             Write-Host ""
-            Write-Host "  You are up to date." -ForegroundColor Green
-        }
-        elseif ($installed -and $installed -ne $latest) {
-            Write-Host ""
-            Write-Host "  An update may be available. Run without 'check' to upgrade." -ForegroundColor Yellow
+            if ($comparison -lt 0) {
+                Write-Host "  An update is available. Run without 'check' to upgrade." -ForegroundColor Yellow
+            }
+            elseif ($comparison -eq 0) {
+                Write-Host "  You are up to date." -ForegroundColor Green
+            }
+            else {
+                Write-Host "  Your installed build is newer than the current public release." -ForegroundColor Cyan
+            }
         }
     }
     else {
@@ -664,7 +690,7 @@ function Show-GpuInfo {
 # MAIN
 # ===============================
 function Invoke-Main {
-    if ($Help -or $Subcommand -eq 'help') {
+    if ($script:HelpRequested -or $script:RequestedSubcommand -eq 'help') {
         Show-Usage
         return
     }
@@ -677,7 +703,7 @@ function Invoke-Main {
         Write-Host ""
     }
 
-    switch ($Subcommand) {
+    switch ($script:RequestedSubcommand) {
         'info' {
             Show-Info
             return
@@ -695,7 +721,7 @@ function Invoke-Main {
     $arch = Get-WindowsArchToken
     Write-Ok "Architecture: $arch"
 
-    $target = $Version
+    $target = $script:RequestedVersion
     if (-not $target) {
         $latest = Get-LatestVersion -Arch $arch
         if ($latest) {
