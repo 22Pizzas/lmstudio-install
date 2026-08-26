@@ -265,11 +265,33 @@ Describe 'Windows state and process reliability' {
             if ($script:InstallPathCalls -eq 1) { return $installPath }
             return $null
         }
-        Mock Start-Process { [pscustomobject]@{ ExitCode = 0 } }
+        Mock Start-Process {
+            Remove-Item -LiteralPath (Join-Path $installPath 'LM Studio.exe') -Force
+            [pscustomobject]@{ ExitCode = 0 }
+        }
 
         { Invoke-Uninstall } | Should -Not -Throw
         Test-Path -LiteralPath $script:StateDir | Should -BeFalse
         Should -Invoke Start-Process -ParameterFilter { $ArgumentList -match '/S' } -Times 1 -Exactly
+    }
+
+    It 'checks the original install path after the registry entry disappears' {
+        $installPath = Join-Path $TestDrive 'orphaned-install'
+        New-Item -ItemType Directory -Path $installPath | Out-Null
+        Set-Content -LiteralPath (Join-Path $installPath 'LM Studio.exe') -Value executable
+        New-Item -ItemType Directory -Path $script:StateDir | Out-Null
+        Set-Content -LiteralPath $script:VersionFile -Value '1.2.3'
+        $script:InstallPathCalls = 0
+        Mock Get-LmStudioUninstallCommand { '"C:\LM Studio\uninstall.exe" /allusers' }
+        Mock Get-LmStudioInstallPath {
+            $script:InstallPathCalls++
+            if ($script:InstallPathCalls -eq 1) { return $installPath }
+            return $null
+        }
+        Mock Start-Process { [pscustomobject]@{ ExitCode = 0 } }
+
+        { Invoke-Uninstall } | Should -Throw '*still exists*'
+        Test-Path -LiteralPath $script:StateDir | Should -BeTrue
     }
 
     It 'never recursively removes a registry InstallLocation fallback' {

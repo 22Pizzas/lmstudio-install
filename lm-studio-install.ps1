@@ -607,10 +607,11 @@ function Invoke-Uninstall {
     }
 
     $remainingPath = Get-LmStudioInstallPath
-    if ($remainingPath) {
-        $remainingExe = Join-Path $remainingPath 'LM Studio.exe'
+    $pathsToVerify = @($installPath, $remainingPath) | Where-Object { $_ } | Select-Object -Unique
+    foreach ($pathToVerify in $pathsToVerify) {
+        $remainingExe = Join-Path $pathToVerify 'LM Studio.exe'
         if (Test-Path -LiteralPath $remainingExe) {
-            throw "Uninstaller exited successfully but LM Studio.exe still exists at $remainingPath"
+            throw "Uninstaller exited successfully but LM Studio.exe still exists at $pathToVerify"
         }
     }
 
