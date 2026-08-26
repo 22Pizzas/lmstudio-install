@@ -217,10 +217,109 @@ make_managed_install() {
         detect_architecture() { echo x64; }
         show_security_warning() { :; }
         download_file() { printf partial > "$2"; }
+        verify_sha512() { :; }
         validate_download() { return 1; }
         main -v 2.0.0 -y
     ' _ "$PROJECT_ROOT/lm-studio-install.sh"
 
     [ "$status" -ne 0 ]
     [ "$(find "$TMPDIR" -type f | wc -l)" -eq 0 ]
+}
+
+@test "accepts a matching SHA-512 sidecar" {
+    printf payload > "$TEST_ROOT/app.AppImage"
+    local expected
+    expected=$(sha512sum "$TEST_ROOT/app.AppImage" | awk '{print $1}')
+
+    run env EXPECTED_SHA512="$expected" bash -c '
+        source "$1"; trap - EXIT INT TERM
+        declare -F verify_sha512 >/dev/null || { echo "Missing required installer function: verify_sha512" >&2; exit 99; }
+        fetch_text() { printf "%s\n" "$EXPECTED_SHA512"; }
+        verify_sha512 "$2" "https://installers.lmstudio.ai/app.AppImage"
+    ' _ "$PROJECT_ROOT/lm-studio-install.sh" "$TEST_ROOT/app.AppImage"
+
+    [ "$status" -eq 0 ]
+}
+
+@test "rejects a mismatched SHA-512 sidecar" {
+    printf payload > "$TEST_ROOT/app.AppImage"
+
+    run bash -c '
+        source "$1"; trap - EXIT INT TERM
+        declare -F verify_sha512 >/dev/null || { echo "Missing required installer function: verify_sha512" >&2; exit 99; }
+        fetch_text() { printf "%0128d\n" 0; }
+        verify_sha512 "$2" "https://installers.lmstudio.ai/app.AppImage"
+    ' _ "$PROJECT_ROOT/lm-studio-install.sh" "$TEST_ROOT/app.AppImage"
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"SHA-512 mismatch"* ]]
+}
+
+@test "rejects a malformed SHA-512 sidecar" {
+    printf payload > "$TEST_ROOT/app.AppImage"
+
+    run bash -c '
+        source "$1"; trap - EXIT INT TERM
+        declare -F verify_sha512 >/dev/null || { echo "Missing required installer function: verify_sha512" >&2; exit 99; }
+        fetch_text() { printf malformed; }
+        verify_sha512 "$2" "https://installers.lmstudio.ai/app.AppImage"
+    ' _ "$PROJECT_ROOT/lm-studio-install.sh" "$TEST_ROOT/app.AppImage"
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Malformed SHA-512 sidecar"* ]]
+}
+
+@test "rejects a multiline SHA-512 sidecar" {
+    printf payload > "$TEST_ROOT/app.AppImage"
+    local expected
+    expected=$(sha512sum "$TEST_ROOT/app.AppImage" | awk '{print $1}')
+
+    run env EXPECTED_SHA512="$expected" bash -c '
+        source "$1"; trap - EXIT INT TERM
+        fetch_text() { printf "%s\n%s\n" "${EXPECTED_SHA512:0:64}" "${EXPECTED_SHA512:64}"; }
+        verify_sha512 "$2" "https://installers.lmstudio.ai/app.AppImage"
+    ' _ "$PROJECT_ROOT/lm-studio-install.sh" "$TEST_ROOT/app.AppImage"
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Malformed SHA-512 sidecar"* ]]
+}
+
+@test "rejects a missing SHA-512 sidecar" {
+    printf payload > "$TEST_ROOT/app.AppImage"
+
+    run bash -c '
+        source "$1"; trap - EXIT INT TERM
+        declare -F verify_sha512 >/dev/null || { echo "Missing required installer function: verify_sha512" >&2; exit 99; }
+        fetch_text() { return 22; }
+        verify_sha512 "$2" "https://installers.lmstudio.ai/app.AppImage"
+    ' _ "$PROJECT_ROOT/lm-studio-install.sh" "$TEST_ROOT/app.AppImage"
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Official SHA-512 sidecar is unavailable"* ]]
+}
+
+@test "sandbox inode mismatch exits before chmod" {
+    printf sandbox > "$TEST_ROOT/chrome-sandbox"
+    mkdir -p "$TEST_ROOT/mock-bin"
+    cat > "$TEST_ROOT/mock-bin/sudo" <<'EOF'
+#!/usr/bin/env bash
+args=("$@")
+args[$((${#args[@]} - 1))]='0:0'
+exec "${args[@]}"
+EOF
+    cat > "$TEST_ROOT/mock-bin/chmod" <<EOF
+#!/usr/bin/env bash
+touch '$TEST_ROOT/chmod-called'
+exit 0
+EOF
+    chmod +x "$TEST_ROOT/mock-bin/sudo" "$TEST_ROOT/mock-bin/chmod"
+
+    run env PATH="$TEST_ROOT/mock-bin:$PATH" bash -c '
+        source "$1"; trap - EXIT INT TERM
+        declare -F configure_chrome_sandbox >/dev/null || { echo "Missing required installer function: configure_chrome_sandbox" >&2; exit 99; }
+        configure_chrome_sandbox "$2"
+    ' _ "$PROJECT_ROOT/lm-studio-install.sh" "$TEST_ROOT/chrome-sandbox"
+
+    [ "$status" -eq 73 ]
+    [ ! -e "$TEST_ROOT/chmod-called" ]
 }

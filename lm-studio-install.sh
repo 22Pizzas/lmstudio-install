@@ -449,7 +449,7 @@ check_dependencies() {
     local cmd
     # curl is required; wget is optional (curl can download too).
     # sudo is only needed later for chrome-sandbox and is handled there.
-    for cmd in curl file od; do
+    for cmd in curl file od sha512sum; do
         command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
     done
     if [[ ${#missing[@]} -gt 0 ]]; then
@@ -566,9 +566,8 @@ show_security_warning() {
     echo "" >&2
     echo "  This script will download LM Studio and use sudo" >&2
     echo "  to configure chrome-sandbox (SUID root)." >&2
-    echo "  LM Studio does not publish official checksums." >&2
-    echo "  Downloads are verified only by ELF magic bytes and" >&2
-    echo "  minimum file size — not a cryptographic signature." >&2
+    echo "  Downloads are verified against LM Studio's official" >&2
+    echo "  SHA-512 sidecar before the AppImage is extracted." >&2
     echo "" >&2
 
     if $OPT_YES; then
@@ -656,6 +655,36 @@ validate_download() {
     log_success "Download validated (ELF magic OK, size ${actual_size} bytes)"
 }
 
+fetch_text() {
+    local url="$1"
+    curl -fsSL --retry 3 --retry-delay 2 --max-time 30 "$url"
+}
+
+verify_sha512() {
+    local file="$1"
+    local artifact_url="$2"
+    local expected actual
+
+    if ! expected=$(fetch_text "${artifact_url}.sha512"); then
+        log_error "Official SHA-512 sidecar is unavailable."
+        return 1
+    fi
+    # Command substitution removes trailing LF; remove only the corresponding
+    # final CR. Any embedded whitespace remains and fails the strict format.
+    expected=${expected%$'\r'}
+    if [[ ! "$expected" =~ ^[[:xdigit:]]{128}$ ]]; then
+        log_error "Malformed SHA-512 sidecar."
+        return 1
+    fi
+
+    read -r actual _ < <(sha512sum -- "$file")
+    if [[ "${actual,,}" != "${expected,,}" ]]; then
+        log_error "SHA-512 mismatch."
+        return 1
+    fi
+    log_success "SHA-512 verified"
+}
+
 # download_file() — Shared downloader: aria2c → wget → curl
 download_file() {
     local url="$1"
@@ -713,6 +742,7 @@ download_appimage() {
     temp_track "$tmp"
 
     download_file "$url" "$tmp" || return 1
+    verify_sha512 "$tmp" "$url" || return 1
     validate_download "$tmp" || return 1
     DOWNLOADED_APPIMAGE="$tmp"
 }
@@ -724,8 +754,21 @@ download_appimage() {
 # extract_and_install() — Extract AppImage and install to INSTALL_DIR
 # FIX: No longer sets BACKUP_CREATED=false. The caller (main) owns that flag.
 # FIX: Added a 5-minute timeout on AppImage extraction to prevent infinite hangs.
-# FIX: chrome-sandbox SUID is set only after verifying the file's inode hasn't
-#      changed between extraction and chmod, closing the race window.
+configure_chrome_sandbox() {
+    local sandbox="$1"
+    local expected
+    expected=$(stat -Lc '%d:%i' -- "$sandbox") || return 1
+
+    sudo bash -c '
+        set -euo pipefail
+        exec 9<"$1"
+        [[ "$(stat -Lc "%d:%i" /proc/self/fd/9)" == "$2" ]] || exit 73
+        chown root:root /proc/self/fd/9
+        chmod 4755 /proc/self/fd/9
+        [[ "$(stat -Lc "%u:%g:%a" /proc/self/fd/9)" == "0:0:4755" ]]
+    ' bash "$sandbox" "$expected"
+}
+
 extract_and_install() {
     local appimage_file="$1"
     local version="$2"
@@ -762,24 +805,11 @@ extract_and_install() {
     rm -f "$appimage_file" 2>/dev/null || true
     temp_untrack "$appimage_file"
 
-    # FIX: Capture the inode of chrome-sandbox before handing it to sudo.
-    # If the inode after the chown differs, another process swapped the file
-    # during the window between mv and chmod — abort rather than grant SUID
-    # to an unexpected binary.
     local sandbox="${INSTALL_DIR}/chrome-sandbox"
     if [[ -f "$sandbox" ]]; then
         if command -v sudo >/dev/null 2>&1; then
             log_info "Configuring chrome-sandbox (requires sudo)..."
-            local inode_before inode_after
-            inode_before=$(stat -c '%i' "$sandbox" 2>/dev/null || stat -f '%i' "$sandbox")
-            if sudo chown root:root "$sandbox" 2>/dev/null; then
-                inode_after=$(stat -c '%i' "$sandbox" 2>/dev/null || stat -f '%i' "$sandbox")
-                if [[ "$inode_before" != "$inode_after" ]]; then
-                    log_error "chrome-sandbox inode changed during chown — aborting SUID setup."
-                    log_error "The installation directory may have been tampered with."
-                    return 1
-                fi
-                sudo chmod 4755 "$sandbox"
+            if configure_chrome_sandbox "$sandbox"; then
                 log_success "chrome-sandbox configured (SUID root)"
             else
                 log_warn "Could not configure chrome-sandbox (sudo denied or failed)."

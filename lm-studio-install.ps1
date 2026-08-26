@@ -382,6 +382,46 @@ function Invoke-FileDownload {
     Write-Ok "Downloaded to $Destination"
 }
 
+function Invoke-TextDownload {
+    param([Parameter(Mandatory)][string]$Url)
+    $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 30
+    if ($response.Content -is [byte[]]) {
+        return [System.Text.Encoding]::ASCII.GetString($response.Content)
+    }
+    return [string]$response.Content
+}
+
+function Test-Sha512 {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$ArtifactUrl
+    )
+
+    $expected = (Invoke-TextDownload -Url "$ArtifactUrl.sha512").Trim()
+    if ($expected -notmatch '^[A-Fa-f0-9]{128}$') {
+        throw 'Malformed SHA-512 sidecar.'
+    }
+    $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA512).Hash
+    if ($actual -ine $expected) {
+        throw 'SHA-512 mismatch.'
+    }
+    Write-Ok 'SHA-512 verified'
+}
+
+function Test-LmStudioSignature {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $signature = Get-AuthenticodeSignature -LiteralPath $Path
+    if ($signature.Status -ne 'Valid') {
+        throw "Invalid Authenticode signature: $($signature.Status)"
+    }
+    $subject = [string]$signature.SignerCertificate.Subject
+    if ($subject -notmatch '(?:^|,\s*)O=Element Labs Inc\.(?:,|$)') {
+        throw "Unexpected installer publisher: $subject"
+    }
+    Write-Ok 'Authenticode signature verified (Element Labs Inc.)'
+}
+
 # ===============================
 # INSTALL / UNINSTALL
 # ===============================
@@ -391,8 +431,8 @@ function Show-SecurityNotice {
     Write-WarnMsg " SECURITY NOTICE"
     Write-WarnMsg "======================================================"
     Write-Host "  This script downloads LM Studio from official servers."
-    Write-Host "  LM Studio does not publish installer checksums."
-    Write-Host "  Validation is PE/MZ magic + minimum file size only."
+    Write-Host "  The installer is verified with LM Studio's official"
+    Write-Host "  SHA-512 sidecar and an Element Labs Authenticode signature."
     Write-Host ""
 
     if ($Yes) {
@@ -673,6 +713,8 @@ function Invoke-Main {
         if (-not (Test-PeExecutable -Path $dest)) {
             throw "Download validation failed."
         }
+        Test-Sha512 -Path $dest -ArtifactUrl $url
+        Test-LmStudioSignature -Path $dest
         Install-LmStudio -InstallerPath $dest -Ver $target
         Show-GpuInfo
         Write-Host ""
