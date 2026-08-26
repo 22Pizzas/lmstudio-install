@@ -112,9 +112,6 @@ Options:
   -Quiet, -q                 Suppress informational output
   -Help, -h                  Show this help
 
-Environment:
-  LMS_INSTALL_DIR            Preferred install path hint (passed to installer when supported)
-
 Examples:
   .\lm-studio-install.ps1
   .\lm-studio-install.ps1 -Version 0.4.20-1 -Yes
