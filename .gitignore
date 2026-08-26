@@ -3,3 +3,4 @@
 temp/
 *.tmp
 .cache/
+.worktrees/
