@@ -116,10 +116,10 @@ USE_ARIA2=false
 # CLEANUP TRAP & ROLLBACK
 # ===============================
 # TEMP_FILES tracks paths to delete on exit.
-# BACKUP_CREATED is owned exclusively by main(); functions signal intent via
-# return values rather than mutating it directly.
 TEMP_FILES=()
 BACKUP_CREATED=false
+NEW_INSTALL_CREATED=false
+DOWNLOADED_APPIMAGE=""
 
 # temp_track() — Add a path to the cleanup list
 temp_track() { TEMP_FILES+=("$1"); }
@@ -141,28 +141,43 @@ temp_untrack() {
 # cleanup() — Runs on EXIT/INT/TERM; deletes temp files and optionally rolls back
 cleanup() {
     local exit_code=$?
+    trap - EXIT INT TERM
+
     local f
     for f in "${TEMP_FILES[@]}"; do
         if [[ -n "$f" ]]; then
-            rm -rf "$f" 2>/dev/null || true
+            rm -rf -- "$f" 2>/dev/null || true
         fi
     done
 
-    if [[ $exit_code -ne 0 && "$BACKUP_CREATED" == true && -d "$BACKUP_DIR" ]]; then
-        log_warn "Rolling back to previous installation..."
-        rm -rf "${INSTALL_DIR:?}" 2>/dev/null || true
-        mv "$BACKUP_DIR" "$INSTALL_DIR" 2>/dev/null || true
-        log_info "Rollback complete."
-    elif [[ "$BACKUP_CREATED" == true && -d "$BACKUP_DIR" ]]; then
-        rm -rf "${BACKUP_DIR:?}" 2>/dev/null || true
+    if [[ $exit_code -ne 0 ]]; then
+        if [[ "$BACKUP_CREATED" == true && -d "$BACKUP_DIR" ]]; then
+            log_warn "Rolling back to previous installation..."
+            if rm -rf -- "${INSTALL_DIR:?}" 2>/dev/null &&
+               [[ ! -e "$INSTALL_DIR" && ! -L "$INSTALL_DIR" ]] &&
+               mv -- "$BACKUP_DIR" "$INSTALL_DIR" 2>/dev/null; then
+                log_info "Rollback complete."
+            else
+                log_error "Automatic rollback failed; the backup remains at $BACKUP_DIR"
+            fi
+        elif [[ "$NEW_INSTALL_CREATED" == true ]]; then
+            # A fresh install has no backup to restore. Remove only integration
+            # files carrying our ownership markers before removing the app.
+            remove_owned_link "${BIN_DIR}/lm-studio" "${INSTALL_DIR}/lm-studio" 2>/dev/null || true
+            remove_owned_link "${BIN_DIR}/lms" "${INSTALL_DIR}/lms" 2>/dev/null || true
+            remove_owned_desktop_entry "${DESKTOP_DIR}/lm-studio.desktop" 2>/dev/null || true
+            rm -rf -- "${INSTALL_DIR:?}" 2>/dev/null || true
+        fi
     fi
 
     if [[ $exit_code -ne 0 ]]; then
         echo -e "${RED}Installation failed.${NC}" >&2
     fi
-    exit $exit_code
+    exit "$exit_code"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ===============================
 # LOGGING
@@ -245,13 +260,18 @@ validate_install_paths() {
     esac
 }
 
-is_managed_install() {
-    [[ -d "$INSTALL_DIR" ]] || return 1
-    [[ -f "$MANAGED_MARKER" ]] && return 0
+is_managed_tree() {
+    local tree="$1"
+    [[ -d "$tree" && ! -L "$tree" ]] || return 1
+    [[ -f "$tree/.lmstudio-installer-managed" ]] && return 0
 
     # Accept installs made by older versions of this script, which predate the
     # explicit marker but always wrote both of these files.
-    [[ -f "$VERSION_FILE" && -x "${INSTALL_DIR}/lm-studio" ]]
+    [[ -f "$tree/.installed_version" && -x "$tree/lm-studio" ]]
+}
+
+is_managed_install() {
+    is_managed_tree "$INSTALL_DIR"
 }
 
 validate_install_target() {
@@ -327,6 +347,17 @@ remove_owned_desktop_entry() {
     fi
 }
 
+remove_owned_backup() {
+    if [[ ! -e "$BACKUP_DIR" && ! -L "$BACKUP_DIR" ]]; then
+        return 0
+    fi
+    if is_managed_tree "$BACKUP_DIR"; then
+        rm -rf -- "${BACKUP_DIR:?}"
+    else
+        log_warn "Preserving backup not managed by this script: $BACKUP_DIR"
+    fi
+}
+
 # ===============================
 # SUBCOMMAND IMPLEMENTATIONS
 # ===============================
@@ -366,6 +397,7 @@ cmd_uninstall() {
     remove_owned_link "${BIN_DIR}/lm-studio" "${INSTALL_DIR}/lm-studio"
     remove_owned_link "${BIN_DIR}/lms" "${INSTALL_DIR}/lms"
     remove_owned_desktop_entry "${DESKTOP_DIR}/lm-studio.desktop"
+    remove_owned_backup
     rm -rf "${INSTALL_DIR:?}"
     if command -v update-desktop-database >/dev/null 2>&1; then
         update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
@@ -548,32 +580,43 @@ show_security_warning() {
     [[ "$response" =~ ^[Yy][Ee][Ss]$ ]] || { log_info "Cancelled."; exit 0; }
 }
 
-# check_existing_installation() — Handle existing installs and create a backup
-# FIX: No longer sets BACKUP_CREATED itself. Returns exit code 2 to signal
-# that a backup was made, letting main() own the flag. This removes the hidden
-# side-effect that made rollback logic hard to follow.
-check_existing_installation() {
+# prepare_existing_install() — Back up a verified existing install before any
+# destructive change. The live tree is removed only after cp succeeds.
+prepare_existing_install() {
     local version="$1"
 
-    if [[ -d "$INSTALL_DIR" && -f "$VERSION_FILE" ]]; then
-        local installed; installed=$(cat "$VERSION_FILE")
-        if [[ "$installed" == "$version" ]]; then
-            log_warn "Version $version is already installed."
-            if ! $OPT_YES; then
-                read -rp "Reinstall anyway? (y/n): " reinstall
-                [[ "$reinstall" =~ ^[Yy]$ ]] || { log_info "Cancelled."; exit 0; }
-            fi
-        else
-            log_info "Upgrading $installed → $version"
+    [[ -d "$INSTALL_DIR" ]] || return 0
+    validate_install_target
+
+    local installed="(unknown)"
+    [[ -f "$VERSION_FILE" ]] && installed=$(cat "$VERSION_FILE")
+    if [[ "$installed" == "$version" ]]; then
+        log_warn "Version $version is already installed."
+        if ! $OPT_YES; then
+            read -rp "Reinstall anyway? (y/n): " reinstall
+            [[ "$reinstall" =~ ^[Yy]$ ]] || { log_info "Cancelled."; exit 0; }
         fi
-        log_info "Backing up current installation..."
-        rm -rf "${BACKUP_DIR:?}" 2>/dev/null || true
-        cp -a "$INSTALL_DIR" "$BACKUP_DIR"
-        log_success "Backup created at $BACKUP_DIR"
-        rm -rf "${INSTALL_DIR:?}"
-        return 2   # Signal: backup was created
+    else
+        log_info "Upgrading $installed → $version"
     fi
-    return 0       # Signal: no backup needed
+
+    if [[ -e "$BACKUP_DIR" || -L "$BACKUP_DIR" ]]; then
+        if ! is_managed_tree "$BACKUP_DIR"; then
+            log_error "Refusing to replace an unowned backup path: $BACKUP_DIR"
+            return 1
+        fi
+        rm -rf -- "${BACKUP_DIR:?}"
+    fi
+
+    log_info "Backing up current installation..."
+    if ! cp -a -- "$INSTALL_DIR" "$BACKUP_DIR"; then
+        rm -rf -- "${BACKUP_DIR:?}" 2>/dev/null || true
+        log_error "Could not create backup; existing installation was not changed."
+        return 1
+    fi
+    BACKUP_CREATED=true
+    log_success "Backup created at $BACKUP_DIR"
+    rm -rf -- "${INSTALL_DIR:?}"
 }
 
 # ===============================
@@ -665,18 +708,13 @@ download_appimage() {
     log_info "Downloading v${version} (${arch})..."
     $OPT_QUIET || echo "  URL: $url" >&2
 
-    local tmp; tmp=$(mktemp)
+    local tmp
+    tmp=$(mktemp "${TMPDIR:-/tmp}/LM-Studio.${version}.${arch}.XXXXXX.AppImage")
     temp_track "$tmp"
 
     download_file "$url" "$tmp" || return 1
     validate_download "$tmp" || return 1
-
-    local appimage_out; appimage_out="$(dirname "$tmp")/${appimage_name}"
-    mv "$tmp" "$appimage_out"
-    temp_untrack "$tmp"
-    temp_track "$appimage_out"
-
-    echo "$appimage_out"
+    DOWNLOADED_APPIMAGE="$tmp"
 }
 
 # ===============================
@@ -717,6 +755,7 @@ extract_and_install() {
     log_info "Installing to ${INSTALL_DIR}..."
     mkdir -p "$(dirname "$INSTALL_DIR")"
     mv "$extracted" "$INSTALL_DIR"
+    NEW_INSTALL_CREATED=true
     temp_untrack "$extract_tmp"
     rm -rf "${extract_tmp:?}" 2>/dev/null || true
 
@@ -865,24 +904,22 @@ main() {
 
     show_security_warning
 
-    # FIX: check_existing_installation now signals backup status via return code
-    # rather than mutating BACKUP_CREATED itself. main() owns the flag.
-    local check_rc=0
-    check_existing_installation "$version" || check_rc=$?
-    if [[ $check_rc -eq 2 ]]; then
-        BACKUP_CREATED=true
-    fi
-
-    local appimage_file
-    appimage_file=$(download_appimage "$version" "$arch")
-    extract_and_install "$appimage_file" "$version"
-
-    # Disarm rollback: installation succeeded, backup is no longer needed.
-    BACKUP_CREATED=false
+    prepare_existing_install "$version"
+    download_appimage "$version" "$arch"
+    extract_and_install "$DOWNLOADED_APPIMAGE" "$version"
+    NEW_INSTALL_CREATED=true
 
     create_symlinks
     create_desktop_entry
     post_install_info
+
+    # Integration succeeded, so the new tree is committed. Backup cleanup is
+    # best-effort and never converts a working install into a rollback failure.
+    NEW_INSTALL_CREATED=false
+    BACKUP_CREATED=false
+    if [[ -d "$BACKUP_DIR" ]]; then
+        rm -rf -- "${BACKUP_DIR:?}" || log_warn "Could not remove old backup: $BACKUP_DIR"
+    fi
 
     echo "" >&2
     log_success "LM Studio v${version} installed successfully!"

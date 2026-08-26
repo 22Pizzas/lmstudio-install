@@ -112,3 +112,115 @@ make_managed_install() {
     [ "$(cat "$BIN_DIR/lms")" = foreign-cli ]
     [ "$(cat "$DESKTOP_DIR/lm-studio.desktop")" = foreign-desktop ]
 }
+
+@test "uninstall removes an installer-managed backup" {
+    make_managed_install 1.0.0
+    mkdir -p "${INSTALL_DIR}.bak"
+    printf '#!/usr/bin/env bash\n' > "${INSTALL_DIR}.bak/lm-studio"
+    chmod +x "${INSTALL_DIR}.bak/lm-studio"
+    printf '0.9.0\n' > "${INSTALL_DIR}.bak/.installed_version"
+    printf 'schema=1\n' > "${INSTALL_DIR}.bak/.lmstudio-installer-managed"
+
+    run bash -c 'source "$1"; trap - EXIT INT TERM; OPT_YES=true; cmd_uninstall' _ \
+        "$PROJECT_ROOT/lm-studio-install.sh"
+
+    [ "$status" -eq 0 ]
+    [ ! -e "$INSTALL_DIR" ]
+    [ ! -e "${INSTALL_DIR}.bak" ]
+}
+
+@test "backup copy failure preserves the live install" {
+    make_managed_install 1.0.0
+
+    run bash -c '
+        source "$1"
+        cp() { return 9; }
+        check_dependencies() { :; }
+        detect_architecture() { echo x64; }
+        show_security_warning() { :; }
+        download_appimage() { return 8; }
+        main -v 2.0.0 -y
+    ' _ "$PROJECT_ROOT/lm-studio-install.sh"
+
+    [ "$status" -ne 0 ]
+    [ "$(cat "$INSTALL_DIR/.installed_version")" = 1.0.0 ]
+    [ -x "$INSTALL_DIR/lm-studio" ]
+    [ ! -e "${INSTALL_DIR}.bak" ]
+}
+
+@test "successful upgrade removes its backup" {
+    make_managed_install 1.0.0
+
+    run env MOCK_INTEGRATION_RC=0 bash -c '
+        source "$1"
+        check_dependencies() { :; }
+        detect_architecture() { echo x64; }
+        show_security_warning() { :; }
+        download_appimage() {
+            DOWNLOADED_APPIMAGE="$TMPDIR/mock.AppImage"
+            printf mock > "$DOWNLOADED_APPIMAGE"
+            printf "%s\n" "$DOWNLOADED_APPIMAGE"
+        }
+        extract_and_install() {
+            mkdir -p "$INSTALL_DIR"
+            printf "#!/usr/bin/env bash\n" > "$INSTALL_DIR/lm-studio"
+            chmod +x "$INSTALL_DIR/lm-studio"
+            printf "%s\n" "$2" > "$VERSION_FILE"
+            printf "schema=1\n" > "$MANAGED_MARKER"
+        }
+        create_symlinks() { return "$MOCK_INTEGRATION_RC"; }
+        create_desktop_entry() { :; }
+        post_install_info() { :; }
+        main -v 2.0.0 -y
+    ' _ "$PROJECT_ROOT/lm-studio-install.sh"
+
+    [ "$status" -eq 0 ]
+    [ "$(cat "$INSTALL_DIR/.installed_version")" = 2.0.0 ]
+    [ ! -e "${INSTALL_DIR}.bak" ]
+}
+
+@test "integration failure restores the previous install" {
+    make_managed_install 1.0.0
+
+    run env MOCK_INTEGRATION_RC=7 bash -c '
+        source "$1"
+        check_dependencies() { :; }
+        detect_architecture() { echo x64; }
+        show_security_warning() { :; }
+        download_appimage() {
+            DOWNLOADED_APPIMAGE="$TMPDIR/mock.AppImage"
+            printf mock > "$DOWNLOADED_APPIMAGE"
+            printf "%s\n" "$DOWNLOADED_APPIMAGE"
+        }
+        extract_and_install() {
+            mkdir -p "$INSTALL_DIR"
+            printf "#!/usr/bin/env bash\n" > "$INSTALL_DIR/lm-studio"
+            chmod +x "$INSTALL_DIR/lm-studio"
+            printf "%s\n" "$2" > "$VERSION_FILE"
+            printf "schema=1\n" > "$MANAGED_MARKER"
+        }
+        create_symlinks() { return "$MOCK_INTEGRATION_RC"; }
+        create_desktop_entry() { :; }
+        post_install_info() { :; }
+        main -v 2.0.0 -y
+    ' _ "$PROJECT_ROOT/lm-studio-install.sh"
+
+    [ "$status" -eq 7 ]
+    [ "$(cat "$INSTALL_DIR/.installed_version")" = 1.0.0 ]
+    [ ! -e "${INSTALL_DIR}.bak" ]
+}
+
+@test "failed validation leaves no temporary download" {
+    run bash -c '
+        source "$1"
+        check_dependencies() { :; }
+        detect_architecture() { echo x64; }
+        show_security_warning() { :; }
+        download_file() { printf partial > "$2"; }
+        validate_download() { return 1; }
+        main -v 2.0.0 -y
+    ' _ "$PROJECT_ROOT/lm-studio-install.sh"
+
+    [ "$status" -ne 0 ]
+    [ "$(find "$TMPDIR" -type f | wc -l)" -eq 0 ]
+}
