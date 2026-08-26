@@ -15,7 +15,7 @@ Official one-liners on [lmstudio.ai/download](https://lmstudio.ai/download) (`in
 
 ### Requirements
 
-- **Required:** `curl`, `file`, `od` (coreutils)
+- **Required:** `curl`, `file`, `od`, `sha512sum` (the latter two are provided by coreutils)
 - **Optional:** `wget`, `aria2c` (faster downloads), `sudo` (chrome-sandbox SUID), `timeout`
 
 ### Usage
@@ -44,7 +44,7 @@ chmod +x lm-studio-install.sh
 | Flag | Description |
 |------|-------------|
 | `-v, --ver <version>` | Version to install (e.g. `0.4.20-1`) |
-| `-y, --yes` | Non-interactive; accept prompts |
+| `-y, --yes` | Strictly non-interactive; accept prompts without GUI fallback |
 | `-q, --quiet` | Suppress informational output |
 | `-h, --help` | Show help |
 
@@ -59,16 +59,18 @@ chmod +x lm-studio-install.sh
 
 ### Environment
 
-- `LMS_INSTALL_DIR` — override install directory (default: `~/.local/share/lm-studio`)
+- `LMS_INSTALL_DIR` — override the absolute install directory (default: `~/.local/share/lm-studio`). Broad paths such as `/`, `$HOME`, and `.local` roots are rejected.
 
 ### What it does
 
 1. Detects arch (`x64` / `arm64`) and latest version via official download redirect  
 2. Downloads from `installers.lmstudio.ai`  
-3. Validates ELF magic + minimum size  
+3. Verifies the official `<artifact>.sha512` sidecar, then checks ELF magic + minimum size
 4. Extracts AppImage, creates `~/.local/bin` symlinks and a desktop entry  
 5. Optionally configures `chrome-sandbox` (SUID) with sudo  
-6. Backs up and rolls back on failed upgrades  
+6. Backs up and rolls back on failed upgrades, including launcher/desktop integration failures
+
+The Linux installer marks the application, launchers, and desktop entry it owns. It refuses to replace an existing unowned install directory or foreign integration files, and uninstall removes only managed artifacts.
 
 ## Windows
 
@@ -104,7 +106,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 | Flag | Description |
 |------|-------------|
 | `-Version`, `-v`, `-ver` | Version to install (e.g. `0.4.20-1`) |
-| `-Yes`, `-y` | Non-interactive; silent install when possible |
+| `-Yes`, `-y` | Strictly non-interactive; silent install with no GUI retry |
 | `-Quiet`, `-q` | Suppress informational output |
 | `-Help`, `-h` | Show help |
 
@@ -116,17 +118,21 @@ Same as Linux: `info`, `check`, `uninstall`, or no subcommand to install/upgrade
 
 1. Detects arch (`x64` / `arm64`) and latest version via official download redirect  
 2. Downloads `LM-Studio-<ver>-<arch>.exe` from official servers  
-3. Validates PE/MZ header + minimum size  
+3. Verifies the official `<artifact>.sha512` sidecar, a valid Authenticode signature from `Element Labs Inc.`, and PE/MZ + minimum size
 4. Runs the installer (`/S` when `-Yes`)  
-5. Records version under `%LOCALAPPDATA%\lm-studio-installer`  
-6. Uninstall uses the Windows registry uninstaller when available  
+5. Confirms `LM Studio.exe` exists before recording version state under `%LOCALAPPDATA%\lm-studio-installer`
+6. Uses only an exact LM Studio registry record for uninstall and retains state if uninstall fails
 
 ## Security
 
-LM Studio does **not** publish official installer checksums. These scripts verify:
+Both scripts fail closed unless the downloaded artifact matches LM Studio's official SHA-512 sidecar:
 
-- **Linux:** ELF magic bytes + minimum file size (50 MB floor)  
-- **Windows:** PE/MZ header + minimum file size (50 MB floor)  
+- **Linux:** SHA-512, ELF magic bytes, and a 50 MB minimum-size check
+- **Windows:** SHA-512, valid Authenticode from `Element Labs Inc.`, PE/MZ bytes, and a 50 MB minimum-size check
+
+Missing, malformed, or mismatched sidecars are fatal. Windows also rejects unsigned, invalidly signed, or unexpected-publisher installers. The magic and size checks remain defense-in-depth corruption checks.
+
+Update checks compare all numeric version and build components and report one of: up to date, update available, or installed build newer than the public release. Explicit cancellation exits successfully (`0`); usage and operational failures exit `1`.
 
 Always prefer downloads from `lmstudio.ai` / `installers.lmstudio.ai`. Review the scripts before running them, especially when piping remote code to a shell.
 
@@ -168,6 +174,8 @@ powershell -ExecutionPolicy Bypass -File .\lm-studio-install.ps1 -Yes
 ```
 
 **Rollback (Linux failed upgrade)**
+
+Rollback is automatic. If automatic restoration itself cannot complete, the managed backup remains at `~/.local/share/lm-studio.bak` for manual recovery:
 
 ```bash
 rm -rf ~/.local/share/lm-studio

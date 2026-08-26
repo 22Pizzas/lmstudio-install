@@ -13,7 +13,11 @@ These scripts download and install **LM Studio** from official hosts:
 - `https://lmstudio.ai/...`
 - `https://installers.lmstudio.ai/...`
 
-They validate downloads with lightweight checks only (ELF/PE magic and minimum size). **LM Studio does not publish official installer checksums**, so cryptographic signature verification of the app itself is not available here.
+Every downloaded artifact must match LM Studio's official `<artifact>.sha512` sidecar. Linux also checks ELF magic and minimum size. Windows additionally requires a valid Authenticode signature whose publisher is `Element Labs Inc.`, plus PE/MZ and minimum-size checks. Missing, malformed, or mismatched sidecars and invalid/unexpected signatures stop installation before execution or extraction.
+
+Linux canonicalizes the configured install path and rejects broad deletion targets, unowned install trees, and foreign launcher/desktop files. Upgrades remain transactional through system integration, and failures restore the prior managed tree. The privileged `chrome-sandbox` setup opens the target once and performs inode verification, ownership, mode changes, and post-verification through that file descriptor.
+
+Windows treats its recorded version as a cache, not proof of installation. Discovery requires a live `LM Studio.exe` and an exact registry product match. Non-interactive mode never retries with a GUI, and failed or incomplete uninstall attempts retain installer state.
 
 ## Reporting a vulnerability
 
@@ -54,4 +58,5 @@ Include:
 - Review the scripts before running them, especially when piped from the network.
 - Prefer cloning this repo and running local files over `curl | bash` when possible.
 - On Linux, understand that `chrome-sandbox` SUID setup uses `sudo`.
-- Keep your system packages (`curl`, etc.) updated.
+- Keep your system packages (`curl`, coreutils, etc.) updated.
+- Treat checksum/signature failures as fatal; do not bypass them to force an install.

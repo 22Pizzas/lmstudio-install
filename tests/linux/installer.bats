@@ -226,6 +226,34 @@ make_managed_install() {
     [ "$(find "$TMPDIR" -type f | wc -l)" -eq 0 ]
 }
 
+@test "interrupt cleanup removes tracked temporary files" {
+    local tracked="$TMPDIR/interrupt.tmp"
+
+    run bash -c '
+        source "$1"
+        printf temporary > "$2"
+        temp_track "$2"
+        kill -INT "$$"
+    ' _ "$PROJECT_ROOT/lm-studio-install.sh" "$tracked"
+
+    [ "$status" -eq 130 ]
+    [ ! -e "$tracked" ]
+}
+
+@test "termination cleanup removes tracked temporary files" {
+    local tracked="$TMPDIR/termination.tmp"
+
+    run bash -c '
+        source "$1"
+        printf temporary > "$2"
+        temp_track "$2"
+        kill -TERM "$$"
+    ' _ "$PROJECT_ROOT/lm-studio-install.sh" "$tracked"
+
+    [ "$status" -eq 143 ]
+    [ ! -e "$tracked" ]
+}
+
 @test "accepts a matching SHA-512 sidecar" {
     printf payload > "$TEST_ROOT/app.AppImage"
     local expected

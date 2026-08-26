@@ -230,7 +230,7 @@ function Get-ExeFileVersion {
         $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($ExePath)
         return Get-VersionFromInfo -Info $info
     }
-    catch { }
+    catch { Write-Verbose "Could not read LM Studio file version: $($_.Exception.Message)" }
     return $null
 }
 
@@ -243,7 +243,11 @@ function Get-RecordedVersion {
 }
 
 function Set-RecordedVersion {
+    [CmdletBinding(SupportsShouldProcess)]
     param([string]$Ver)
+    if (-not $PSCmdlet.ShouldProcess($script:VersionFile, "Record installed LM Studio version $Ver")) {
+        return
+    }
     if (-not (Test-Path -LiteralPath $script:StateDir)) {
         New-Item -ItemType Directory -Path $script:StateDir -Force | Out-Null
     }
@@ -270,7 +274,7 @@ function Get-LmStudioRegistryEntry {
                     return $entry
                 }
             }
-            catch { }
+            catch { Write-Verbose "Could not inspect registry entry $($key.PSPath): $($_.Exception.Message)" }
         }
     }
     return $null

@@ -42,17 +42,41 @@ This repository provides cross-platform scripts that install the **LM Studio des
 - Keep `set -euo pipefail`.
 - Prefer `curl` as the baseline network tool; keep wget/aria2c as optional accelerators.
 - Do not hardcode a single release version as “latest”; resolve via the official redirect when possible.
-- Validate downloads (ELF magic + minimum size) before extraction.
-- Avoid destructive paths without confirmation unless `-y` is set.
-- Run `bash -n lm-studio-install.sh` before submitting.
+- Verify the official SHA-512 sidecar before extraction; keep ELF magic and minimum size as defense in depth.
+- Preserve canonical path checks, managed ownership markers, and rollback state around every destructive operation.
+- Treat `-y` as strictly non-interactive; it does not weaken validation or ownership checks.
 
 ### PowerShell (`lm-studio-install.ps1`)
 
 - Target Windows PowerShell 5.1+ (and preferably PowerShell 7).
 - Use `Set-StrictMode -Version Latest` and clear error handling.
-- Validate PE/MZ + minimum size before running installers.
-- Prefer silent install only when `-Yes` is passed; fall back to interactive on failure.
+- Verify SHA-512 and the `Element Labs Inc.` Authenticode publisher; keep PE/MZ + minimum size as defense in depth.
+- Use silent install only when `-Yes` is passed. A silent failure must return failure, never retry interactively.
+- Treat cached version state as non-authoritative and preserve it until install/uninstall success is verified.
 - Avoid requiring admin unless the underlying installer does.
+
+## Local verification
+
+Run the checks for the platform you changed. Cross-platform changes should run both suites.
+
+```bash
+bash -n lm-studio-install.sh
+shellcheck -x -e SC2034,SC1090,SC1091 lm-studio-install.sh
+bats tests/linux/installer.bats
+```
+
+```powershell
+$tokens = $null
+$errors = $null
+[void][System.Management.Automation.Language.Parser]::ParseFile(
+    "$PWD\lm-studio-install.ps1", [ref]$tokens, [ref]$errors
+)
+if ($errors) { $errors; exit 1 }
+Invoke-ScriptAnalyzer .\lm-studio-install.ps1 -Severity Error,Warning
+Invoke-Pester .\tests\windows\Installer.Tests.ps1 -Output Detailed
+```
+
+Behavior tests use temporary directories and mocks; they must not download or execute real installers or uninstall the developer's LM Studio installation.
 
 ### Documentation
 
