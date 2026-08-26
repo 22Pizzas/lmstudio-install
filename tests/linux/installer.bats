@@ -481,3 +481,22 @@ EOF
     [ ! -L "$BIN_DIR/lm-studio" ]
     [ ! -L "$BIN_DIR/lms" ]
 }
+
+@test "rollback reports an integration restore failure" {
+    make_managed_install 1.0.0
+
+    run bash -c '
+        source "$1"
+        cp -a -- "$INSTALL_DIR" "$BACKUP_DIR"
+        BACKUP_CREATED=true
+        INTEGRATION_SNAPSHOTTED=true
+        LM_STUDIO_LINK_WAS_PRESENT=true
+        LM_STUDIO_LINK_TARGET="$INSTALL_DIR/lm-studio"
+        ln() { return 1; }
+        exit 9
+    ' _ "$PROJECT_ROOT/lm-studio-install.sh"
+
+    [ "$status" -eq 9 ]
+    [[ "$output" == *"Could not fully restore the previous desktop integration"* ]]
+    [ "$(cat "$INSTALL_DIR/.installed_version")" = 1.0.0 ]
+}

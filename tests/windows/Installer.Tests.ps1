@@ -363,6 +363,22 @@ Describe 'Windows state and process reliability' {
         Should -Invoke Remove-Item -Times 0 -Exactly
     }
 
+    It 'refuses a reparse-point download directory before writing' {
+        New-Item -ItemType Directory -Path $script:StateDir | Out-Null
+        New-Item -ItemType Directory -Path $script:DownloadDir | Out-Null
+        $script:ExpectedDownloadPath = $script:DownloadDir
+        $script:ExpectedStateItem = Get-Item -LiteralPath $script:StateDir -Force
+        Mock Get-Item { $script:ExpectedStateItem }
+        Mock Get-Item {
+            [pscustomobject]@{ Attributes = [IO.FileAttributes]::ReparsePoint }
+        } -ParameterFilter { $LiteralPath -eq $script:ExpectedDownloadPath }
+        Mock Remove-Item {}
+
+        { Invoke-FileDownload -Url 'https://example.test/installer.exe' -Destination (Join-Path $script:DownloadDir 'installer.exe') } |
+            Should -Throw '*downloads*reparse point*'
+        Should -Invoke Remove-Item -Times 0 -Exactly
+    }
+
     It 'checks the original install path after the registry entry disappears' {
         $installPath = Join-Path $TestDrive 'orphaned-install'
         New-Item -ItemType Directory -Path $installPath | Out-Null

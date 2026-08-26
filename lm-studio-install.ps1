@@ -267,12 +267,24 @@ function Assert-SafeStateDirectory {
     }
 }
 
+function Assert-SafeDownloadDirectory {
+    if (-not (Test-Path -LiteralPath $script:DownloadDir)) { return }
+    $item = Get-Item -LiteralPath $script:DownloadDir -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Refusing to use installer downloads because it is a reparse point: $script:DownloadDir"
+    }
+    if (-not (Test-Path -LiteralPath $script:DownloadDir -PathType Container)) {
+        throw "Refusing to use unexpected installer downloads state: $script:DownloadDir"
+    }
+}
+
 function Initialize-InstallerState {
     Assert-SafeStateDirectory
     if (-not (Test-Path -LiteralPath $script:StateDir)) {
         New-Item -ItemType Directory -Path $script:StateDir -Force | Out-Null
     }
     Assert-SafeStateDirectory
+    Assert-SafeDownloadDirectory
     if (Test-Path -LiteralPath $script:StateMarker) {
         $markerItem = Get-Item -LiteralPath $script:StateMarker -Force
         if (($markerItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {

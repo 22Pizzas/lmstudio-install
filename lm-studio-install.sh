@@ -397,28 +397,29 @@ snapshot_integration_state() {
 restore_integration_state() {
     [[ "$INTEGRATION_SNAPSHOTTED" == true ]] || return 0
 
-    mkdir -p "$BIN_DIR"
+    mkdir -p "$BIN_DIR" || return 1
     if [[ "$LM_STUDIO_LINK_WAS_PRESENT" == true ]]; then
-        ln -sfn -- "$LM_STUDIO_LINK_TARGET" "${BIN_DIR}/lm-studio"
+        ln -sfn -- "$LM_STUDIO_LINK_TARGET" "${BIN_DIR}/lm-studio" || return 1
     else
-        remove_owned_link "${BIN_DIR}/lm-studio" "${INSTALL_DIR}/lm-studio"
+        remove_owned_link "${BIN_DIR}/lm-studio" "${INSTALL_DIR}/lm-studio" || return 1
     fi
     if [[ "$LMS_LINK_WAS_PRESENT" == true ]]; then
-        ln -sfn -- "$LMS_LINK_TARGET" "${BIN_DIR}/lms"
+        ln -sfn -- "$LMS_LINK_TARGET" "${BIN_DIR}/lms" || return 1
     else
-        remove_owned_link "${BIN_DIR}/lms" "${INSTALL_DIR}/lms"
+        remove_owned_link "${BIN_DIR}/lms" "${INSTALL_DIR}/lms" || return 1
     fi
 
     local desktop_path="${DESKTOP_DIR}/lm-studio.desktop"
     if [[ "$DESKTOP_WAS_PRESENT" == true && -f "$DESKTOP_BACKUP_FILE" ]]; then
-        mkdir -p "$DESKTOP_DIR"
-        cp -p -- "$DESKTOP_BACKUP_FILE" "$desktop_path"
+        mkdir -p "$DESKTOP_DIR" || return 1
+        cp -p -- "$DESKTOP_BACKUP_FILE" "$desktop_path" || return 1
     else
-        remove_owned_desktop_entry "$desktop_path"
+        remove_owned_desktop_entry "$desktop_path" || return 1
     fi
     if command -v update-desktop-database >/dev/null 2>&1; then
         update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
     fi
+    return 0
 }
 
 # ===============================

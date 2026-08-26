@@ -110,6 +110,9 @@ jobs:
       - name: Windows PowerShell 5.1 compatibility
         shell: powershell
         run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module -Name Pester -MinimumVersion 5.5.0 -Force -AllowClobber -Scope CurrentUser
+          Import-Module Pester -MinimumVersion 5.5.0 -Force
           $errs = $null
           $tokens = $null
           [void][System.Management.Automation.Language.Parser]::ParseFile(
