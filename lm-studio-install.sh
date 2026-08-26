@@ -86,7 +86,9 @@ readonly INSTALL_DIR="${LMS_INSTALL_DIR:-${HOME}/.local/share/lm-studio}"
 readonly BIN_DIR="${HOME}/.local/bin"
 readonly DESKTOP_DIR="${HOME}/.local/share/applications"
 readonly VERSION_FILE="${INSTALL_DIR}/.installed_version"
+readonly MANAGED_MARKER="${INSTALL_DIR}/.lmstudio-installer-managed"
 readonly BACKUP_DIR="${INSTALL_DIR}.bak"
+readonly DESKTOP_MARKER='X-LMStudio-Installer-Managed=true'
 
 # Minimum expected AppImage size (bytes). Real builds are hundreds of MB;
 # this guards against truncated downloads that still pass ELF magic checks.
@@ -218,6 +220,113 @@ parse_args() {
     done
 }
 
+# Refuse install roots whose removal would erase a broad user or system path.
+validate_install_paths() {
+    if ! command -v realpath >/dev/null 2>&1; then
+        log_error "realpath is required to validate the installation directory."
+        return 1
+    fi
+    if [[ "$INSTALL_DIR" != /* ]]; then
+        log_error "LMS_INSTALL_DIR must be an absolute path: $INSTALL_DIR"
+        return 1
+    fi
+
+    local resolved_home resolved_install resolved_bin resolved_desktop
+    resolved_home=$(realpath -m -- "$HOME")
+    resolved_install=$(realpath -m -- "$INSTALL_DIR")
+    resolved_bin=$(realpath -m -- "$BIN_DIR")
+    resolved_desktop=$(realpath -m -- "$DESKTOP_DIR")
+
+    case "$resolved_install" in
+        /|"$resolved_home"|"$resolved_home/.local"|"$resolved_home/.local/share"|"$resolved_bin"|"$resolved_desktop")
+            log_error "Unsafe install directory: $INSTALL_DIR"
+            return 1
+            ;;
+    esac
+}
+
+is_managed_install() {
+    [[ -d "$INSTALL_DIR" ]] || return 1
+    [[ -f "$MANAGED_MARKER" ]] && return 0
+
+    # Accept installs made by older versions of this script, which predate the
+    # explicit marker but always wrote both of these files.
+    [[ -f "$VERSION_FILE" && -x "${INSTALL_DIR}/lm-studio" ]]
+}
+
+validate_install_target() {
+    if [[ ! -e "$INSTALL_DIR" && ! -L "$INSTALL_DIR" ]]; then
+        return 0
+    fi
+    if ! is_managed_install; then
+        log_error "Existing install path is not managed by this script: $INSTALL_DIR"
+        return 1
+    fi
+}
+
+link_points_to() {
+    local link_path="$1"
+    local expected_target="$2"
+    [[ -L "$link_path" ]] || return 1
+    [[ "$(readlink -f -- "$link_path" 2>/dev/null)" == "$(readlink -f -- "$expected_target" 2>/dev/null)" ]]
+}
+
+ensure_owned_link_slot() {
+    local link_path="$1"
+    local expected_target="$2"
+    if [[ ! -e "$link_path" && ! -L "$link_path" ]]; then
+        return 0
+    fi
+    if link_points_to "$link_path" "$expected_target"; then
+        return 0
+    fi
+    log_error "Refusing to overwrite launcher not managed by this script: $link_path"
+    return 1
+}
+
+remove_owned_link() {
+    local link_path="$1"
+    local expected_target="$2"
+    if [[ ! -e "$link_path" && ! -L "$link_path" ]]; then
+        return 0
+    fi
+    if link_points_to "$link_path" "$expected_target"; then
+        rm -f -- "$link_path"
+    else
+        log_warn "Preserving launcher not managed by this script: $link_path"
+    fi
+}
+
+desktop_entry_is_owned() {
+    local desktop_path="$1"
+    [[ -f "$desktop_path" && ! -L "$desktop_path" ]] || return 1
+    grep -Fqx -- "$DESKTOP_MARKER" "$desktop_path"
+}
+
+ensure_owned_desktop_slot() {
+    local desktop_path="$1"
+    if [[ ! -e "$desktop_path" && ! -L "$desktop_path" ]]; then
+        return 0
+    fi
+    if desktop_entry_is_owned "$desktop_path"; then
+        return 0
+    fi
+    log_error "Refusing to overwrite desktop entry not managed by this script: $desktop_path"
+    return 1
+}
+
+remove_owned_desktop_entry() {
+    local desktop_path="$1"
+    if [[ ! -e "$desktop_path" && ! -L "$desktop_path" ]]; then
+        return 0
+    fi
+    if desktop_entry_is_owned "$desktop_path"; then
+        rm -f -- "$desktop_path"
+    else
+        log_warn "Preserving desktop entry not managed by this script: $desktop_path"
+    fi
+}
+
 # ===============================
 # SUBCOMMAND IMPLEMENTATIONS
 # ===============================
@@ -241,6 +350,7 @@ cmd_uninstall() {
         log_warn "LM Studio does not appear to be installed at $INSTALL_DIR"
         exit 0
     fi
+    validate_install_target
     local ver="(unknown)"
     [[ -f "$VERSION_FILE" ]] && ver=$(cat "$VERSION_FILE")
     echo ""
@@ -251,9 +361,12 @@ cmd_uninstall() {
         [[ "$response" =~ ^[Yy][Ee][Ss]$ ]] || { log_info "Cancelled."; exit 0; }
     fi
 
+    # Check link ownership while their targets still exist, then remove only
+    # integration files that this installer created.
+    remove_owned_link "${BIN_DIR}/lm-studio" "${INSTALL_DIR}/lm-studio"
+    remove_owned_link "${BIN_DIR}/lms" "${INSTALL_DIR}/lms"
+    remove_owned_desktop_entry "${DESKTOP_DIR}/lm-studio.desktop"
     rm -rf "${INSTALL_DIR:?}"
-    rm -f "${BIN_DIR}/lm-studio" "${BIN_DIR}/lms"
-    rm -f "${DESKTOP_DIR}/lm-studio.desktop"
     if command -v update-desktop-database >/dev/null 2>&1; then
         update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
     fi
@@ -641,17 +754,20 @@ extract_and_install() {
     fi
 
     echo "$version" > "$VERSION_FILE"
+    printf 'schema=1\n' > "$MANAGED_MARKER"
 }
 
 create_symlinks() {
     log_info "Creating symlinks in ~/.local/bin..."
     mkdir -p "$BIN_DIR"
 
-    ln -sf "${INSTALL_DIR}/lm-studio" "${BIN_DIR}/lm-studio"
+    ensure_owned_link_slot "${BIN_DIR}/lm-studio" "${INSTALL_DIR}/lm-studio"
+    ln -sfn "${INSTALL_DIR}/lm-studio" "${BIN_DIR}/lm-studio"
     log_success "lm-studio → ${BIN_DIR}/lm-studio"
 
     if [[ -f "${INSTALL_DIR}/lms" ]]; then
-        ln -sf "${INSTALL_DIR}/lms" "${BIN_DIR}/lms"
+        ensure_owned_link_slot "${BIN_DIR}/lms" "${INSTALL_DIR}/lms"
+        ln -sfn "${INSTALL_DIR}/lms" "${BIN_DIR}/lms"
         log_success "lms (CLI) → ${BIN_DIR}/lms"
     fi
 
@@ -665,6 +781,8 @@ create_symlinks() {
 create_desktop_entry() {
     log_info "Creating desktop entry..."
     mkdir -p "$DESKTOP_DIR"
+    local desktop_path="${DESKTOP_DIR}/lm-studio.desktop"
+    ensure_owned_desktop_slot "$desktop_path"
 
     # FIX: Limit icon search depth to avoid slow traversal on large installs.
     local icon_path="${INSTALL_DIR}/lm-studio.png"
@@ -686,9 +804,10 @@ Terminal=false
 Categories=Development;Science;
 StartupWMClass=lm-studio
 Keywords=AI;LLM;Machine Learning;
+${DESKTOP_MARKER}
 EOF
 
-    chmod +x "${DESKTOP_DIR}/lm-studio.desktop"
+    chmod +x "$desktop_path"
     if command -v update-desktop-database >/dev/null 2>&1; then
         update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
     fi
@@ -712,6 +831,7 @@ post_install_info() {
 # ===============================
 main() {
     parse_args "$@"
+    validate_install_paths
 
     $OPT_QUIET || {
         echo "" >&2
@@ -727,6 +847,8 @@ main() {
         check)     check_dependencies
                    cmd_check;                  exit 0 ;;
     esac
+
+    validate_install_target
 
     check_dependencies
     local arch; arch=$(detect_architecture)
