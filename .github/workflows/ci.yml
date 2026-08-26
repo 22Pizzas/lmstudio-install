@@ -22,8 +22,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install ShellCheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Install Linux test tools
+        run: sudo apt-get update && sudo apt-get install -y shellcheck bats
 
       - name: bash -n syntax check
         run: bash -n lm-studio-install.sh
@@ -37,6 +37,9 @@ jobs:
         run: |
           chmod +x lm-studio-install.sh
           ./lm-studio-install.sh --help
+
+      - name: Behavior tests
+        run: bats tests/linux/installer.bats
 
       - name: Fetch latest version (network)
         run: |
@@ -58,6 +61,7 @@ jobs:
         run: |
           Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
           Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+          Install-Module -Name Pester -MinimumVersion 5.5.0 -Force -Scope CurrentUser
 
       - name: Parse script AST
         shell: pwsh
@@ -94,3 +98,7 @@ jobs:
           .\lm-studio-install.ps1 -Help
           .\lm-studio-install.ps1 check
           .\lm-studio-install.ps1 info
+
+      - name: Behavior tests
+        shell: pwsh
+        run: Invoke-Pester -Path .\tests\windows\Installer.Tests.ps1 -CI -Output Detailed

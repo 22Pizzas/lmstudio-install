@@ -690,10 +690,12 @@ function Invoke-Main {
     }
 }
 
-try {
-    Invoke-Main
-}
-catch {
-    Write-ErrMsg $_.Exception.Message
-    exit 1
+if ($env:LMS_INSTALLER_SOURCE_ONLY -ne '1') {
+    try {
+        Invoke-Main
+    }
+    catch {
+        Write-ErrMsg $_.Exception.Message
+        exit 1
+    }
 }

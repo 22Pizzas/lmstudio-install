@@ -777,4 +777,6 @@ main() {
 #   1  General error (missing deps, invalid version, download failure, etc.)
 #   2  User cancelled
 # ===========================================================================
-main "$@"
+if [[ "${LMS_INSTALLER_SOURCE_ONLY:-0}" != "1" ]]; then
+    main "$@"
+fi
