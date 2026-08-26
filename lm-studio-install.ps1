@@ -61,6 +61,8 @@ $script:DownloadDir = Join-Path $script:StateDir 'downloads'
 $script:MinInstallerBytes = 50MB
 $script:LatestUrlBase = 'https://lmstudio.ai/download/latest/win32'
 $script:InstallerUrlBase = 'https://installers.lmstudio.ai/win32'
+$script:NonInteractive = [bool]$Yes
+$script:QuietOutput = [bool]$Quiet
 
 # Common install locations used by Electron / NSIS builds
 $script:KnownInstallRoots = @(
@@ -75,11 +77,11 @@ $script:KnownInstallRoots = @(
 # ===============================
 function Write-Info {
     param([string]$Message)
-    if (-not $Quiet) { Write-Host "i  $Message" -ForegroundColor Cyan }
+    if (-not $script:QuietOutput) { Write-Host "i  $Message" -ForegroundColor Cyan }
 }
 function Write-Ok {
     param([string]$Message)
-    if (-not $Quiet) { Write-Host "OK $Message" -ForegroundColor Green }
+    if (-not $script:QuietOutput) { Write-Host "OK $Message" -ForegroundColor Green }
 }
 function Write-WarnMsg {
     param([string]$Message)
@@ -184,20 +186,30 @@ function Get-InstallerUrl {
     return "$script:InstallerUrlBase/$Arch/$Ver/$name"
 }
 
+function ConvertTo-LmStudioVersion {
+    param([string]$Value)
+    if ($Value -and $Value.Trim() -match '^([0-9]+\.[0-9]+\.[0-9]+)(?:[.+-]([0-9]+))?') {
+        if ($Matches[2]) { return "$($Matches[1])-$($Matches[2])" }
+        return $Matches[1]
+    }
+    return $null
+}
+
+function Get-VersionFromInfo {
+    param($Info)
+    foreach ($candidate in @($Info.FileVersion, $Info.ProductVersion)) {
+        $normalized = ConvertTo-LmStudioVersion -Value ([string]$candidate)
+        if ($normalized) { return $normalized }
+    }
+    return $null
+}
+
 function Get-ExeFileVersion {
     param([string]$ExePath)
     if (-not $ExePath -or -not (Test-Path -LiteralPath $ExePath)) { return $null }
     try {
-        $vi = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($ExePath)
-        foreach ($candidate in @($vi.ProductVersion, $vi.FileVersion)) {
-            if (-not $candidate) { continue }
-            # Normalize e.g. 0.4.20.1 or 0.4.20-1
-            $norm = $candidate.Trim()
-            if ($norm -match '^([0-9]+\.[0-9]+\.[0-9]+)(?:[.-]([0-9]+))?') {
-                if ($Matches[2]) { return "$($Matches[1])-$($Matches[2])" }
-                return $Matches[1]
-            }
-        }
+        $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($ExePath)
+        return Get-VersionFromInfo -Info $info
     }
     catch { }
     return $null
@@ -207,12 +219,6 @@ function Get-RecordedVersion {
     if (Test-Path -LiteralPath $script:VersionFile) {
         $v = (Get-Content -LiteralPath $script:VersionFile -Raw).Trim()
         if ($v) { return $v }
-    }
-    # Fall back to FileVersion of installed executable
-    $path = Get-LmStudioInstallPath
-    if ($path) {
-        $exe = Join-Path $path 'LM Studio.exe'
-        return Get-ExeFileVersion -ExePath $exe
     }
     return $null
 }
@@ -228,37 +234,7 @@ function Set-RecordedVersion {
 # ===============================
 # DISCOVERY (install / uninstall)
 # ===============================
-function Get-LmStudioInstallPath {
-    foreach ($root in $script:KnownInstallRoots) {
-        $exe = Join-Path $root 'LM Studio.exe'
-        if (Test-Path -LiteralPath $exe) { return $root }
-    }
-
-    # Registry uninstall keys
-    $uninstallRoots = @(
-        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
-        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
-        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
-    )
-    foreach ($root in $uninstallRoots) {
-        if (-not (Test-Path $root)) { continue }
-        Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
-            try {
-                $p = Get-ItemProperty $_.PSPath -ErrorAction Stop
-                $dn = [string]$p.DisplayName
-                if ($dn -like '*LM Studio*') {
-                    if ($p.InstallLocation -and (Test-Path -LiteralPath $p.InstallLocation)) {
-                        return $p.InstallLocation
-                    }
-                }
-            }
-            catch { }
-        }
-    }
-    return $null
-}
-
-function Get-LmStudioUninstallCommand {
+function Get-LmStudioRegistryEntry {
     $uninstallRoots = @(
         'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
         'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
@@ -268,17 +244,106 @@ function Get-LmStudioUninstallCommand {
         if (-not (Test-Path $root)) { continue }
         foreach ($key in (Get-ChildItem $root -ErrorAction SilentlyContinue)) {
             try {
-                $p = Get-ItemProperty $key.PSPath -ErrorAction Stop
-                $dn = [string]$p.DisplayName
-                if ($dn -like '*LM Studio*') {
-                    if ($p.QuietUninstallString) { return [string]$p.QuietUninstallString }
-                    if ($p.UninstallString) { return [string]$p.UninstallString }
+                $entry = Get-ItemProperty $key.PSPath -ErrorAction Stop
+                $displayName = [string]$entry.DisplayName
+                if ($displayName -match '^LM Studio(?:\s|$)' -and
+                    [string]$entry.Publisher -eq 'LM Studio') {
+                    return $entry
                 }
             }
             catch { }
         }
     }
     return $null
+}
+
+function Get-ObjectPropertyValue {
+    param(
+        [Parameter(Mandatory)]$InputObject,
+        [Parameter(Mandatory)][string]$Name
+    )
+    $property = $InputObject.PSObject.Properties[$Name]
+    if ($property) { return $property.Value }
+    return $null
+}
+
+function Get-LmStudioInstallPath {
+    foreach ($root in $script:KnownInstallRoots) {
+        $exe = Join-Path $root 'LM Studio.exe'
+        if (Test-Path -LiteralPath $exe) { return $root }
+    }
+
+    $entry = Get-LmStudioRegistryEntry
+    $installLocation = if ($entry) { Get-ObjectPropertyValue -InputObject $entry -Name 'InstallLocation' } else { $null }
+    if ($installLocation) {
+        $registryExe = Join-Path ([string]$installLocation) 'LM Studio.exe'
+        if (Test-Path -LiteralPath $registryExe) {
+            return [string]$installLocation
+        }
+    }
+    return $null
+}
+
+function Get-LmStudioUninstallCommand {
+    $entry = Get-LmStudioRegistryEntry
+    if (-not $entry) { return $null }
+    $quietCommand = Get-ObjectPropertyValue -InputObject $entry -Name 'QuietUninstallString'
+    if ($quietCommand) { return [string]$quietCommand }
+    $command = Get-ObjectPropertyValue -InputObject $entry -Name 'UninstallString'
+    if ($command) { return [string]$command }
+    return $null
+}
+
+function Get-LmStudioState {
+    $path = Get-LmStudioInstallPath
+    $cached = Get-RecordedVersion
+    if (-not $path) {
+        return [pscustomobject]@{
+            IsInstalled = $false
+            Path = $null
+            Version = $null
+            CachedVersion = $cached
+        }
+    }
+
+    $exe = Join-Path $path 'LM Studio.exe'
+    if (-not (Test-Path -LiteralPath $exe)) {
+        return [pscustomobject]@{
+            IsInstalled = $false
+            Path = $null
+            Version = $null
+            CachedVersion = $cached
+        }
+    }
+
+    $entry = Get-LmStudioRegistryEntry
+    $detectedVersion = if ($entry) {
+        $displayVersion = Get-ObjectPropertyValue -InputObject $entry -Name 'DisplayVersion'
+        ConvertTo-LmStudioVersion -Value ([string]$displayVersion)
+    }
+    else { $null }
+    if (-not $detectedVersion) { $detectedVersion = Get-ExeFileVersion -ExePath $exe }
+    if (-not $detectedVersion) { $detectedVersion = $cached }
+
+    return [pscustomobject]@{
+        IsInstalled = $true
+        Path = $path
+        Version = $detectedVersion
+        CachedVersion = $cached
+    }
+}
+
+function Split-UninstallCommand {
+    param([Parameter(Mandatory)][string]$Command)
+
+    if ($Command -match '^\s*"(?<Exe>[^"]+\.exe)"\s*(?<Args>.*)$' -or
+        $Command -match '^\s*(?<Exe>.+?\.exe)\s*(?<Args>.*)$') {
+        return [pscustomobject]@{
+            Exe = $Matches.Exe
+            Args = $Matches.Args.Trim()
+        }
+    }
+    throw "Unsupported uninstall command: $Command"
 }
 
 # ===============================
@@ -330,7 +395,7 @@ function Invoke-FileDownload {
     }
 
     Write-Info "Downloading..."
-    if (-not $Quiet) { Write-Host "  URL: $Url" }
+    if (-not $script:QuietOutput) { Write-Host "  URL: $Url" }
 
     # Progress-friendly download via WebClient / BITS not required; use IWR stream
     $req = [System.Net.HttpWebRequest]::Create($Url)
@@ -352,7 +417,7 @@ function Invoke-FileDownload {
                 if ($n -le 0) { break }
                 $file.Write($buffer, 0, $n)
                 $readTotal += $n
-                if (-not $Quiet) {
+                if (-not $script:QuietOutput) {
                     $now = [DateTime]::UtcNow
                     if (($now - $last).TotalMilliseconds -gt 250) {
                         if ($total -gt 0) {
@@ -377,7 +442,7 @@ function Invoke-FileDownload {
     }
     finally {
         $resp.Close()
-        if (-not $Quiet) { Write-Progress -Activity 'Downloading LM Studio' -Completed }
+        if (-not $script:QuietOutput) { Write-Progress -Activity 'Downloading LM Studio' -Completed }
     }
     Write-Ok "Downloaded to $Destination"
 }
@@ -435,7 +500,7 @@ function Show-SecurityNotice {
     Write-Host "  SHA-512 sidecar and an Element Labs Authenticode signature."
     Write-Host ""
 
-    if ($Yes) {
+    if ($script:NonInteractive) {
         Write-Info "Skipping confirmation (-Yes)"
         return
     }
@@ -454,37 +519,27 @@ function Install-LmStudio {
 
     Write-Info "Running installer for v$Ver..."
 
-    # Electron-builder NSIS typically accepts /S for silent.
-    # Strategy: if -Yes, run with /S first; fall back to interactive on failure.
-    $exitCode = 0
-    if ($Yes) {
+    # -Yes is strictly non-interactive: never retry without /S.
+    if ($script:NonInteractive) {
         $proc = Start-Process -FilePath $InstallerPath -ArgumentList '/S' -Wait -PassThru
-        $exitCode = $proc.ExitCode
-        if ($exitCode -ne 0) {
-            Write-WarnMsg "Silent install exited with code $exitCode; retrying interactive..."
-            $proc = Start-Process -FilePath $InstallerPath -Wait -PassThru
-            $exitCode = $proc.ExitCode
-        }
     }
     else {
         $proc = Start-Process -FilePath $InstallerPath -Wait -PassThru
-        $exitCode = $proc.ExitCode
     }
 
-    if ($exitCode -ne 0) {
-        throw "Installer exited with code $exitCode"
+    if ($proc.ExitCode -ne 0) {
+        throw "Installer exited with code $($proc.ExitCode)"
+    }
+
+    $installPath = Get-LmStudioInstallPath
+    $installedExe = if ($installPath) { Join-Path $installPath 'LM Studio.exe' } else { $null }
+    if (-not $installedExe -or -not (Test-Path -LiteralPath $installedExe)) {
+        throw 'Installer exited successfully but LM Studio.exe was not found.'
     }
 
     Set-RecordedVersion -Ver $Ver
     Write-Ok "Installer finished for v$Ver"
-
-    $installPath = Get-LmStudioInstallPath
-    if ($installPath) {
-        Write-Ok "Detected install path: $installPath"
-    }
-    else {
-        Write-Info "Install path not yet detectable (shortcuts may still work)."
-    }
+    Write-Ok "Detected install path: $installPath"
 }
 
 function Invoke-Uninstall {
@@ -492,7 +547,10 @@ function Invoke-Uninstall {
     $installPath = Get-LmStudioInstallPath
     $recorded = Get-RecordedVersion
 
-    if (-not $uninstall -and -not $installPath -and -not $recorded) {
+    if (-not $uninstall -and $installPath) {
+        throw 'LM Studio is present, but no valid registry uninstaller was found. Use Windows Apps settings or the vendor uninstaller; no files were removed.'
+    }
+    if (-not $uninstall) {
         Write-WarnMsg "LM Studio does not appear to be installed."
         return
     }
@@ -501,7 +559,7 @@ function Invoke-Uninstall {
     $verLabel = if ($recorded) { $recorded } else { '(unknown)' }
     Write-WarnMsg "This will remove LM Studio $verLabel and associated installer state."
 
-    if (-not $Yes) {
+    if (-not $script:NonInteractive) {
         $response = Read-Host "Are you sure? (yes/no)"
         if ($response -notmatch '^[Yy][Ee][Ss]$') {
             Write-Info "Cancelled."
@@ -509,56 +567,44 @@ function Invoke-Uninstall {
         }
     }
 
-    if ($uninstall) {
-        Write-Info "Running uninstaller..."
-        # UninstallString may be quoted path + args
-        if ($uninstall -match '^\s*"([^"]+)"\s*(.*)$') {
-            $exe = $Matches[1]
-            $uargs = $Matches[2].Trim()
-            if ($Yes -and $uargs -notmatch '/S') { $uargs = ($uargs + ' /S').Trim() }
-            if ($uargs) {
-                $p = Start-Process -FilePath $exe -ArgumentList $uargs -Wait -PassThru
-            }
-            else {
-                $p = Start-Process -FilePath $exe -ArgumentList $(if ($Yes) { '/S' } else { '' }) -Wait -PassThru
-            }
-            if ($p.ExitCode -ne 0) {
-                Write-WarnMsg "Uninstaller exit code: $($p.ExitCode)"
-            }
-        }
-        else {
-            # bare path or path with unquoted args
-            if ($Yes) {
-                Start-Process -FilePath 'cmd.exe' -ArgumentList "/c $uninstall /S" -Wait | Out-Null
-            }
-            else {
-                Start-Process -FilePath 'cmd.exe' -ArgumentList "/c $uninstall" -Wait | Out-Null
-            }
-        }
+    Write-Info "Running uninstaller..."
+    $parts = Split-UninstallCommand -Command $uninstall
+    $uninstallArgs = $parts.Args
+    if ($script:NonInteractive -and $uninstallArgs -notmatch '(?i)(?:^|\s)/S(?:\s|$)') {
+        $uninstallArgs = ($uninstallArgs + ' /S').Trim()
     }
-    elseif ($installPath) {
-        Write-WarnMsg "No registry uninstaller found; removing directory $installPath"
-        Remove-Item -LiteralPath $installPath -Recurse -Force -ErrorAction SilentlyContinue
+    if ($uninstallArgs) {
+        $process = Start-Process -FilePath $parts.Exe -ArgumentList $uninstallArgs -Wait -PassThru
+    }
+    else {
+        $process = Start-Process -FilePath $parts.Exe -Wait -PassThru
+    }
+    if ($process.ExitCode -ne 0) {
+        throw "Uninstaller exited with code $($process.ExitCode)"
+    }
+
+    $remainingPath = Get-LmStudioInstallPath
+    if ($remainingPath) {
+        $remainingExe = Join-Path $remainingPath 'LM Studio.exe'
+        if (Test-Path -LiteralPath $remainingExe) {
+            throw "Uninstaller exited successfully but LM Studio.exe still exists at $remainingPath"
+        }
     }
 
     if (Test-Path -LiteralPath $script:StateDir) {
-        Remove-Item -LiteralPath $script:StateDir -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $script:StateDir -Recurse -Force
     }
-    Write-Ok "LM Studio uninstalled (or removal attempted)."
+    Write-Ok "LM Studio uninstalled."
 }
 
 function Show-Info {
-    $recorded = Get-RecordedVersion
-    $path = Get-LmStudioInstallPath
+    $state = Get-LmStudioState
     Write-Host ""
-    if ($recorded -or $path) {
-        Write-Host "  Installed version: $(if ($recorded) { $recorded } else { '(unknown)' })" -ForegroundColor Green
-        Write-Host "  Install path:      $(if ($path) { $path } else { '(not found)' })" -ForegroundColor Green
+    if ($state.IsInstalled) {
+        Write-Host "  Installed version: $(if ($state.Version) { $state.Version } else { '(unknown)' })" -ForegroundColor Green
+        Write-Host "  Install path:      $($state.Path)" -ForegroundColor Green
         Write-Host "  State directory:   $script:StateDir" -ForegroundColor Green
-        $exe = if ($path) { Join-Path $path 'LM Studio.exe' } else { $null }
-        if ($exe -and (Test-Path -LiteralPath $exe)) {
-            Write-Host "  Executable:        $exe" -ForegroundColor Green
-        }
+        Write-Host "  Executable:        $(Join-Path $state.Path 'LM Studio.exe')" -ForegroundColor Green
     }
     else {
         Write-Host "  LM Studio does not appear to be installed." -ForegroundColor Yellow
@@ -569,15 +615,10 @@ function Show-Info {
 function Show-Check {
     $arch = Get-WindowsArchToken
     $latest = Get-LatestVersion -Arch $arch
-    $installed = Get-RecordedVersion
-    $pathOnly = $false
-    if (-not $installed) {
-        $path = Get-LmStudioInstallPath
-        if ($path) {
-            $installed = '(present, version unknown)'
-            $pathOnly = $true
-        }
-    }
+    $state = Get-LmStudioState
+    $installed = if ($state.IsInstalled) { $state.Version } else { $null }
+    $pathOnly = $state.IsInstalled -and -not $state.Version
+    if ($pathOnly) { $installed = '(present, version unknown)' }
 
     Write-Host ""
     if ($installed) {
@@ -628,7 +669,7 @@ function Invoke-Main {
         return
     }
 
-    if (-not $Quiet) {
+    if (-not $script:QuietOutput) {
         Write-Host ""
         Write-Host "======================================================="
         Write-Host "         LM Studio Installer / Updater (Windows)       "
@@ -659,7 +700,7 @@ function Invoke-Main {
         $latest = Get-LatestVersion -Arch $arch
         if ($latest) {
             Write-Info "Latest detected version: $latest"
-            if ($Yes) {
+            if ($script:NonInteractive) {
                 $target = $latest
             }
             else {
@@ -687,10 +728,11 @@ function Invoke-Main {
     }
     Write-Ok "Target version: $target"
 
-    $recorded = Get-RecordedVersion
-    if ($recorded -eq $target) {
-        Write-WarnMsg "Version $target is already recorded as installed."
-        if (-not $Yes) {
+    $state = Get-LmStudioState
+    $installedVersion = if ($state.IsInstalled) { $state.Version } else { $null }
+    if ($installedVersion -eq $target) {
+        Write-WarnMsg "Version $target is already installed."
+        if (-not $script:NonInteractive) {
             $re = Read-Host "Reinstall anyway? (y/n)"
             if ($re -notmatch '^[Yy]$') {
                 Write-Info "Cancelled."
@@ -698,8 +740,8 @@ function Invoke-Main {
             }
         }
     }
-    elseif ($recorded) {
-        Write-Info "Upgrading $recorded -> $target"
+    elseif ($installedVersion) {
+        Write-Info "Upgrading $installedVersion -> $target"
     }
 
     Show-SecurityNotice
