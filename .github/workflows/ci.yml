@@ -106,3 +106,21 @@ jobs:
       - name: Behavior tests
         shell: pwsh
         run: Invoke-Pester -Path .\tests\windows\Installer.Tests.ps1 -CI -Output Detailed
+
+      - name: Windows PowerShell 5.1 compatibility
+        shell: powershell
+        run: |
+          $errs = $null
+          $tokens = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            "$pwd\lm-studio-install.ps1",
+            [ref]$tokens,
+            [ref]$errs
+          )
+          if ($errs -and $errs.Count -gt 0) {
+            $errs | ForEach-Object { Write-Error $_.ToString() }
+            exit 1
+          }
+          .\lm-studio-install.ps1 -Help
+          .\lm-studio-install.ps1 info
+          Invoke-Pester -Path .\tests\windows\Installer.Tests.ps1 -CI -Output Detailed

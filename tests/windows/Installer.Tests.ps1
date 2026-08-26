@@ -136,6 +136,9 @@ Describe 'Windows state and process reliability' {
         $script:QuietOutput = $true
         $script:StateDir = Join-Path $TestDrive ("state-{0}" -f [guid]::NewGuid())
         $script:VersionFile = Join-Path $script:StateDir 'installed_version.txt'
+        $script:StateMarker = Join-Path $script:StateDir '.lmstudio-installer-managed'
+        $script:DownloadDir = Join-Path $script:StateDir 'downloads'
+        Mock Start-Sleep {}
     }
 
     It 'normalizes plus build metadata' {
@@ -158,6 +161,12 @@ Describe 'Windows state and process reliability' {
         $state.CachedVersion | Should -Be '1.2.3'
     }
 
+    It 'marks state created by the installer' {
+        Set-RecordedVersion -Ver '1.2.3'
+
+        Test-Path -LiteralPath $script:StateMarker | Should -BeTrue
+    }
+
     It 'rejects similarly named registry products' {
         Mock Test-Path { $true } -ParameterFilter { -not $LiteralPath }
         Mock Get-ChildItem { @([pscustomobject]@{ PSPath = 'registry::helper' }) }
@@ -178,6 +187,32 @@ Describe 'Windows state and process reliability' {
         }
 
         Get-LmStudioUninstallCommand | Should -Be '"C:\LM Studio\uninstall.exe" /allusers'
+    }
+
+    It 'correlates duplicate registry entries with the live install path' {
+        $livePath = 'C:\Program Files\LM Studio'
+        Mock Get-LmStudioRegistryRecord {
+            @(
+                [pscustomobject]@{
+                    DisplayName = 'LM Studio'
+                    Publisher = 'LM Studio'
+                    InstallLocation = 'C:\Users\old\AppData\Local\Programs\LM Studio'
+                    DisplayVersion = '0.4.20+1'
+                    UninstallString = '"C:\Users\old\AppData\Local\Programs\LM Studio\Uninstall LM Studio.exe" /currentuser'
+                },
+                [pscustomobject]@{
+                    DisplayName = 'LM Studio'
+                    Publisher = 'LM Studio'
+                    InstallLocation = $livePath
+                    DisplayVersion = '0.4.21+2'
+                    UninstallString = '"C:\Program Files\LM Studio\Uninstall LM Studio.exe" /allusers'
+                }
+            )
+        }
+
+        $entry = Get-LmStudioRegistryEntry -InstallPath $livePath
+
+        $entry.DisplayVersion | Should -Be '0.4.21+2'
     }
 
     It 'splits a quoted uninstall command without a command shell' {
@@ -216,22 +251,38 @@ Describe 'Windows state and process reliability' {
     }
 
     It 'records state after a verified successful install' {
-        $installPath = Join-Path $TestDrive 'verified-install'
-        New-Item -ItemType Directory -Path $installPath | Out-Null
-        Set-Content -LiteralPath (Join-Path $installPath 'LM Studio.exe') -Value executable
+        $script:ExpectedInstallPath = Join-Path $TestDrive 'verified-install'
+        New-Item -ItemType Directory -Path $script:ExpectedInstallPath | Out-Null
+        Set-Content -LiteralPath (Join-Path $script:ExpectedInstallPath 'LM Studio.exe') -Value executable
         Mock Start-Process { [pscustomobject]@{ ExitCode = 0 } }
-        Mock Get-LmStudioInstallPath { $installPath }
+        Mock Get-LmStudioInstallPath { $script:ExpectedInstallPath }
+        Mock Get-ExeFileVersion { '1.2.3' }
         Mock Set-RecordedVersion {}
 
         { Install-LmStudio -InstallerPath "$TestDrive\i.exe" -Ver 1.2.3 } | Should -Not -Throw
         Should -Invoke Set-RecordedVersion -ParameterFilter { $Ver -eq '1.2.3' } -Times 1 -Exactly
     }
 
+    It 'does not record state when the installed version differs from the request' {
+        $script:ExpectedInstallPath = Join-Path $TestDrive 'wrong-version-install'
+        New-Item -ItemType Directory -Path $script:ExpectedInstallPath | Out-Null
+        Set-Content -LiteralPath (Join-Path $script:ExpectedInstallPath 'LM Studio.exe') -Value executable
+        Mock Start-Process { [pscustomobject]@{ ExitCode = 0 } }
+        Mock Get-LmStudioInstallPath { $script:ExpectedInstallPath }
+        Mock Get-ExeFileVersion { '0.4.21-2' }
+        Mock Set-RecordedVersion {}
+
+        { Install-LmStudio -InstallerPath "$TestDrive\i.exe" -Ver 9.9.9 } |
+            Should -Throw '*expected version 9.9.9*found 0.4.21-2*'
+        Should -Invoke Set-RecordedVersion -Times 0 -Exactly
+    }
+
     It 'keeps state when the uninstaller fails' {
         New-Item -ItemType Directory -Path $script:StateDir | Out-Null
         Set-Content -LiteralPath $script:VersionFile -Value '1.2.3'
+        Set-Content -LiteralPath $script:StateMarker -Value 'schema=1'
         Mock Get-LmStudioUninstallCommand { '"C:\LM Studio\uninstall.exe" /allusers' }
-        Mock Get-LmStudioInstallPath { $null }
+        Mock Get-LmStudioInstallPath { 'C:\LM Studio' }
         Mock Start-Process { [pscustomobject]@{ ExitCode = 23 } }
 
         { Invoke-Uninstall } | Should -Throw '*code 23*'
@@ -258,6 +309,7 @@ Describe 'Windows state and process reliability' {
         Set-Content -LiteralPath (Join-Path $installPath 'LM Studio.exe') -Value executable
         New-Item -ItemType Directory -Path $script:StateDir | Out-Null
         Set-Content -LiteralPath $script:VersionFile -Value '1.2.3'
+        Set-Content -LiteralPath $script:StateMarker -Value 'schema=1'
         $script:InstallPathCalls = 0
         Mock Get-LmStudioUninstallCommand { '"C:\LM Studio\uninstall.exe" /allusers' }
         Mock Get-LmStudioInstallPath {
@@ -273,6 +325,42 @@ Describe 'Windows state and process reliability' {
         { Invoke-Uninstall } | Should -Not -Throw
         Test-Path -LiteralPath $script:StateDir | Should -BeFalse
         Should -Invoke Start-Process -ParameterFilter { $ArgumentList -match '/S' } -Times 1 -Exactly
+    }
+
+    It 'preserves unrelated files in the state directory after uninstall' {
+        $installPath = Join-Path $TestDrive 'removed-install-with-unrelated-state'
+        New-Item -ItemType Directory -Path $installPath | Out-Null
+        Set-Content -LiteralPath (Join-Path $installPath 'LM Studio.exe') -Value executable
+        New-Item -ItemType Directory -Path $script:StateDir | Out-Null
+        Set-Content -LiteralPath $script:VersionFile -Value '1.2.3'
+        Set-Content -LiteralPath $script:StateMarker -Value 'schema=1'
+        $unrelated = Join-Path $script:StateDir 'keep-me.txt'
+        Set-Content -LiteralPath $unrelated -Value 'user data'
+        $script:InstallPathCalls = 0
+        Mock Get-LmStudioUninstallCommand { '"C:\LM Studio\uninstall.exe" /allusers' }
+        Mock Get-LmStudioInstallPath {
+            $script:InstallPathCalls++
+            if ($script:InstallPathCalls -eq 1) { return $installPath }
+            return $null
+        }
+        Mock Start-Process {
+            Remove-Item -LiteralPath (Join-Path $installPath 'LM Studio.exe') -Force
+            [pscustomobject]@{ ExitCode = 0 }
+        }
+
+        { Invoke-Uninstall } | Should -Not -Throw
+        Test-Path -LiteralPath $unrelated | Should -BeTrue
+        Test-Path -LiteralPath $script:VersionFile | Should -BeFalse
+        Test-Path -LiteralPath $script:StateMarker | Should -BeFalse
+    }
+
+    It 'refuses to clean a reparse-point state directory' {
+        New-Item -ItemType Directory -Path $script:StateDir | Out-Null
+        Mock Get-Item { [pscustomobject]@{ Attributes = [IO.FileAttributes]::ReparsePoint } }
+        Mock Remove-Item {}
+
+        { Remove-InstallerState } | Should -Throw '*reparse point*'
+        Should -Invoke Remove-Item -Times 0 -Exactly
     }
 
     It 'checks the original install path after the registry entry disappears' {
@@ -333,6 +421,53 @@ Describe 'Windows update semantics' {
         Mock Invoke-WebRequest { [pscustomobject]@{ Content = '<html>Other product 0.9.9</html>' } }
 
         Get-LatestVersion -Arch x64 | Should -BeNullOrEmpty
+    }
+
+    It 'verifies checksum and signature before launching the installer' {
+        $script:NonInteractive = $true
+        $script:RequestedSubcommand = ''
+        $script:RequestedVersion = '1.2.3'
+        $script:HelpRequested = $false
+        $script:DownloadDir = Join-Path $TestDrive 'ordered-download'
+        $script:Order = New-Object 'System.Collections.Generic.List[string]'
+        Mock Get-WindowsArchToken { 'x64' }
+        Mock Get-LmStudioState {
+            [pscustomobject]@{ IsInstalled = $false; Path = $null; Version = $null; CachedVersion = $null }
+        }
+        Mock Show-SecurityNotice {}
+        Mock Invoke-FileDownload {}
+        Mock Test-PeExecutable { $true }
+        Mock Test-Sha512 { $script:Order.Add('sha') }
+        Mock Test-LmStudioSignature { $script:Order.Add('signature') }
+        Mock Install-LmStudio { $script:Order.Add('install') }
+        Mock Show-GpuInfo {}
+
+        Invoke-Main
+
+        ($script:Order -join ',') | Should -Be 'sha,signature,install'
+    }
+
+    It 'never prompts when non-interactive latest lookup fails' {
+        $script:NonInteractive = $true
+        $script:RequestedSubcommand = ''
+        $script:RequestedVersion = ''
+        $script:HelpRequested = $false
+        Mock Get-WindowsArchToken { 'x64' }
+        Mock Get-LatestVersion { $null }
+        Mock Read-Host { throw 'Read-Host was called' }
+
+        { Invoke-Main } | Should -Throw '*specify -Version*'
+        Should -Invoke Read-Host -Times 0 -Exactly
+    }
+
+    It 'fails check when the latest version cannot be determined' {
+        Mock Get-WindowsArchToken { 'x64' }
+        Mock Get-LatestVersion { $null }
+        Mock Get-LmStudioState {
+            [pscustomobject]@{ IsInstalled = $true; Path = 'C:\LM Studio'; Version = '0.4.21-2'; CachedVersion = $null }
+        }
+
+        { Show-Check } | Should -Throw '*Could not determine latest*'
     }
 
     It 'compares numeric build versions' {

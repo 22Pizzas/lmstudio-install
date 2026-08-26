@@ -418,3 +418,66 @@ EOF
     [ "$status" -eq 0 ]
     [[ "$output" == *"newer than the current public release"* ]]
 }
+
+@test "check fails when the latest version cannot be determined" {
+    run bash -c '
+        source "$1"; trap - EXIT INT TERM
+        detect_architecture() { echo x64; }
+        fetch_latest_version() { return 0; }
+        cmd_check
+    ' _ "$PROJECT_ROOT/lm-studio-install.sh"
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Could not determine latest"* ]]
+}
+
+@test "non-interactive latest failure never reads stdin" {
+    local read_marker="$TEST_ROOT/read-called"
+
+    run env READ_MARKER="$read_marker" bash -c '
+        source "$1"; trap - EXIT INT TERM
+        OPT_YES=true
+        fetch_latest_version() { return 0; }
+        read() { touch "$READ_MARKER"; return 1; }
+        prompt_version x64
+    ' _ "$PROJECT_ROOT/lm-studio-install.sh"
+
+    [ "$status" -eq 1 ]
+    [ ! -e "$read_marker" ]
+    [[ "$output" == *"specify --ver"* ]]
+}
+
+@test "upgrade rollback restores prior integration state" {
+    make_managed_install 1.0.0
+    mkdir -p "$DESKTOP_DIR"
+    printf '[Desktop Entry]\nName=Old LM Studio\nX-LMStudio-Installer-Managed=true\n' > \
+        "$DESKTOP_DIR/lm-studio.desktop"
+    cp "$DESKTOP_DIR/lm-studio.desktop" "$TEST_ROOT/desktop-before"
+
+    run bash -c '
+        source "$1"
+        check_dependencies() { :; }
+        detect_architecture() { echo x64; }
+        show_security_warning() { :; }
+        download_appimage() {
+            DOWNLOADED_APPIMAGE="$TMPDIR/mock.AppImage"
+            printf mock > "$DOWNLOADED_APPIMAGE"
+        }
+        extract_and_install() {
+            mkdir -p "$INSTALL_DIR"
+            printf "#!/usr/bin/env bash\n" > "$INSTALL_DIR/lm-studio"
+            printf "#!/usr/bin/env bash\n" > "$INSTALL_DIR/lms"
+            chmod +x "$INSTALL_DIR/lm-studio" "$INSTALL_DIR/lms"
+            printf "%s\n" "$2" > "$VERSION_FILE"
+            printf "schema=1\n" > "$MANAGED_MARKER"
+        }
+        post_install_info() { return 8; }
+        main -v 2.0.0 -y
+    ' _ "$PROJECT_ROOT/lm-studio-install.sh"
+
+    [ "$status" -eq 8 ]
+    [ "$(cat "$INSTALL_DIR/.installed_version")" = 1.0.0 ]
+    cmp -s "$TEST_ROOT/desktop-before" "$DESKTOP_DIR/lm-studio.desktop"
+    [ ! -L "$BIN_DIR/lm-studio" ]
+    [ ! -L "$BIN_DIR/lms" ]
+}

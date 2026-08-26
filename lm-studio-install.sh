@@ -45,7 +45,7 @@
 #
 # REQUIREMENTS
 # -----------
-#   Minimum: curl, file, od (coreutils)
+#   Minimum: curl, file, od, sha512sum (coreutils)
 #   Optional: wget (fallback downloader), aria2c (faster parallel downloads),
 #             sudo (for chrome-sandbox SUID; app may still run without it),
 #             timeout (prevents hung AppImage extract)
@@ -120,6 +120,13 @@ TEMP_FILES=()
 BACKUP_CREATED=false
 NEW_INSTALL_CREATED=false
 DOWNLOADED_APPIMAGE=""
+INTEGRATION_SNAPSHOTTED=false
+LM_STUDIO_LINK_WAS_PRESENT=false
+LM_STUDIO_LINK_TARGET=""
+LMS_LINK_WAS_PRESENT=false
+LMS_LINK_TARGET=""
+DESKTOP_WAS_PRESENT=false
+DESKTOP_BACKUP_FILE=""
 
 # temp_track() — Add a path to the cleanup list
 temp_track() { TEMP_FILES+=("$1"); }
@@ -143,13 +150,6 @@ cleanup() {
     local exit_code=$?
     trap - EXIT INT TERM
 
-    local f
-    for f in "${TEMP_FILES[@]}"; do
-        if [[ -n "$f" ]]; then
-            rm -rf -- "$f" 2>/dev/null || true
-        fi
-    done
-
     if [[ $exit_code -ne 0 ]]; then
         if [[ "$BACKUP_CREATED" == true && -d "$BACKUP_DIR" ]]; then
             log_warn "Rolling back to previous installation..."
@@ -160,6 +160,8 @@ cleanup() {
             else
                 log_error "Automatic rollback failed; the backup remains at $BACKUP_DIR"
             fi
+            restore_integration_state 2>/dev/null ||
+                log_error "Could not fully restore the previous desktop integration."
         elif [[ "$NEW_INSTALL_CREATED" == true ]]; then
             # A fresh install has no backup to restore. Remove only integration
             # files carrying our ownership markers before removing the app.
@@ -169,6 +171,13 @@ cleanup() {
             rm -rf -- "${INSTALL_DIR:?}" 2>/dev/null || true
         fi
     fi
+
+    local f
+    for f in "${TEMP_FILES[@]}"; do
+        if [[ -n "$f" ]]; then
+            rm -rf -- "$f" 2>/dev/null || true
+        fi
+    done
 
     if [[ $exit_code -ne 0 ]]; then
         echo -e "${RED}Installation failed.${NC}" >&2
@@ -363,6 +372,55 @@ remove_owned_backup() {
     fi
 }
 
+snapshot_integration_state() {
+    [[ "$INTEGRATION_SNAPSHOTTED" == false ]] || return 0
+
+    if [[ -L "${BIN_DIR}/lm-studio" ]]; then
+        LM_STUDIO_LINK_WAS_PRESENT=true
+        LM_STUDIO_LINK_TARGET=$(readlink -- "${BIN_DIR}/lm-studio")
+    fi
+    if [[ -L "${BIN_DIR}/lms" ]]; then
+        LMS_LINK_WAS_PRESENT=true
+        LMS_LINK_TARGET=$(readlink -- "${BIN_DIR}/lms")
+    fi
+
+    local desktop_path="${DESKTOP_DIR}/lm-studio.desktop"
+    if desktop_entry_is_owned "$desktop_path"; then
+        DESKTOP_BACKUP_FILE=$(mktemp "${TMPDIR:-/tmp}/lm-studio.desktop.XXXXXX")
+        temp_track "$DESKTOP_BACKUP_FILE"
+        cp -p -- "$desktop_path" "$DESKTOP_BACKUP_FILE"
+        DESKTOP_WAS_PRESENT=true
+    fi
+    INTEGRATION_SNAPSHOTTED=true
+}
+
+restore_integration_state() {
+    [[ "$INTEGRATION_SNAPSHOTTED" == true ]] || return 0
+
+    mkdir -p "$BIN_DIR"
+    if [[ "$LM_STUDIO_LINK_WAS_PRESENT" == true ]]; then
+        ln -sfn -- "$LM_STUDIO_LINK_TARGET" "${BIN_DIR}/lm-studio"
+    else
+        remove_owned_link "${BIN_DIR}/lm-studio" "${INSTALL_DIR}/lm-studio"
+    fi
+    if [[ "$LMS_LINK_WAS_PRESENT" == true ]]; then
+        ln -sfn -- "$LMS_LINK_TARGET" "${BIN_DIR}/lms"
+    else
+        remove_owned_link "${BIN_DIR}/lms" "${INSTALL_DIR}/lms"
+    fi
+
+    local desktop_path="${DESKTOP_DIR}/lm-studio.desktop"
+    if [[ "$DESKTOP_WAS_PRESENT" == true && -f "$DESKTOP_BACKUP_FILE" ]]; then
+        mkdir -p "$DESKTOP_DIR"
+        cp -p -- "$DESKTOP_BACKUP_FILE" "$desktop_path"
+    else
+        remove_owned_desktop_entry "$desktop_path"
+    fi
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+    fi
+}
+
 # ===============================
 # SUBCOMMAND IMPLEMENTATIONS
 # ===============================
@@ -448,6 +506,9 @@ cmd_check() {
         fi
     else
         echo -e "  Latest:    ${YELLOW}(could not fetch — check https://lmstudio.ai/download)${NC}"
+        echo ""
+        log_error "Could not determine latest LM Studio version."
+        return 1
     fi
     echo ""
 }
@@ -589,6 +650,10 @@ prompt_version() {
 
     log_warn "Could not auto-detect latest version."
     log_info "Check https://lmstudio.ai/download for the current release."
+    if $OPT_YES; then
+        log_error "Could not determine a version in non-interactive mode; specify --ver VERSION."
+        return 1
+    fi
     echo "Enter the exact version to install (e.g. 0.4.20-1):" >&2
     read -r version
     [[ -z "$version" ]] && { log_error "No version entered."; exit 1; }
@@ -653,6 +718,7 @@ prepare_existing_install() {
     fi
     BACKUP_CREATED=true
     log_success "Backup created at $BACKUP_DIR"
+    snapshot_integration_state
     rm -rf -- "${INSTALL_DIR:?}"
 }
 
@@ -851,8 +917,7 @@ extract_and_install() {
                 log_success "chrome-sandbox configured (SUID root)"
             else
                 log_warn "Could not configure chrome-sandbox (sudo denied or failed)."
-                log_warn "You may need: sudo chown root:root '$sandbox' && sudo chmod 4755 '$sandbox'"
-                log_warn "Or launch with --no-sandbox if your environment allows it."
+                log_warn "Resolve sudo access and rerun this installer so the sandbox can be verified safely."
             fi
         else
             log_warn "sudo not found — skipping chrome-sandbox SUID setup."
@@ -899,7 +964,10 @@ create_desktop_entry() {
     fi
     [[ -n "$icon_path" ]] || icon_path="lm-studio"
 
-    cat > "${DESKTOP_DIR}/lm-studio.desktop" <<EOF
+    local staged_desktop
+    staged_desktop=$(mktemp "${DESKTOP_DIR}/.lm-studio.desktop.XXXXXX")
+    temp_track "$staged_desktop"
+    cat > "$staged_desktop" <<EOF
 [Desktop Entry]
 Version=1.0
 Type=Application
@@ -914,7 +982,9 @@ Keywords=AI;LLM;Machine Learning;
 ${DESKTOP_MARKER}
 EOF
 
-    chmod +x "$desktop_path"
+    chmod +x "$staged_desktop"
+    mv -f -- "$staged_desktop" "$desktop_path"
+    temp_untrack "$staged_desktop"
     if command -v update-desktop-database >/dev/null 2>&1; then
         update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
     fi

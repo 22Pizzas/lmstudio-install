@@ -120,8 +120,12 @@ Same as Linux: `info`, `check`, `uninstall`, or no subcommand to install/upgrade
 2. Downloads `LM-Studio-<ver>-<arch>.exe` from official servers  
 3. Verifies the official `<artifact>.sha512` sidecar, a valid Authenticode signature from `Element Labs Inc.`, and PE/MZ + minimum size
 4. Runs the installer (`/S` when `-Yes`)  
-5. Confirms `LM Studio.exe` exists before recording version state under `%LOCALAPPDATA%\lm-studio-installer`
-6. Uses only an exact LM Studio registry record for uninstall and retains state if uninstall fails
+5. Confirms the live `LM Studio.exe` version matches the requested release before recording managed state under `%LOCALAPPDATA%\lm-studio-installer`
+6. Correlates exact registry records with the live install path, rejects ambiguous installs, and retains state if uninstall fails
+
+The Windows state directory has an ownership marker. Uninstall removes only
+known installer artifacts, refuses reparse-point state paths, and preserves any
+unrelated files found there.
 
 ## Security
 
@@ -160,10 +164,10 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
 
 **Linux: chrome-sandbox / startup issues**
 
-```bash
-sudo chown root:root ~/.local/share/lm-studio/chrome-sandbox
-sudo chmod 4755 ~/.local/share/lm-studio/chrome-sandbox
-```
+The installer configures `chrome-sandbox` through an open file descriptor and
+verifies its inode before changing ownership or mode. If `sudo` is denied or
+unavailable, resolve that access issue and rerun the installer; do not repair
+the sandbox with a separate path-based `chown`/`chmod` sequence.
 
 **Windows: execution policy**
 

@@ -57,6 +57,7 @@ $ErrorActionPreference = 'Stop'
 # ===============================
 $script:StateDir = Join-Path $env:LOCALAPPDATA 'lm-studio-installer'
 $script:VersionFile = Join-Path $script:StateDir 'installed_version.txt'
+$script:StateMarker = Join-Path $script:StateDir '.lmstudio-installer-managed'
 $script:DownloadDir = Join-Path $script:StateDir 'downloads'
 $script:MinInstallerBytes = 50MB
 $script:LatestUrlBase = 'https://lmstudio.ai/download/latest/win32'
@@ -248,16 +249,93 @@ function Set-RecordedVersion {
     if (-not $PSCmdlet.ShouldProcess($script:VersionFile, "Record installed LM Studio version $Ver")) {
         return
     }
+    Initialize-InstallerState
+    if (Test-Path -LiteralPath $script:VersionFile) {
+        $versionItem = Get-Item -LiteralPath $script:VersionFile -Force
+        if (($versionItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Refusing to write installer version state because it is a reparse point: $script:VersionFile"
+        }
+    }
+    Set-Content -LiteralPath $script:VersionFile -Value $Ver -Encoding UTF8
+}
+
+function Assert-SafeStateDirectory {
+    if (-not (Test-Path -LiteralPath $script:StateDir)) { return }
+    $item = Get-Item -LiteralPath $script:StateDir -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Refusing to use installer state directory because it is a reparse point: $script:StateDir"
+    }
+}
+
+function Initialize-InstallerState {
+    Assert-SafeStateDirectory
     if (-not (Test-Path -LiteralPath $script:StateDir)) {
         New-Item -ItemType Directory -Path $script:StateDir -Force | Out-Null
     }
-    Set-Content -LiteralPath $script:VersionFile -Value $Ver -Encoding UTF8
+    Assert-SafeStateDirectory
+    if (Test-Path -LiteralPath $script:StateMarker) {
+        $markerItem = Get-Item -LiteralPath $script:StateMarker -Force
+        if (($markerItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Refusing to use installer state marker because it is a reparse point: $script:StateMarker"
+        }
+    }
+    Set-Content -LiteralPath $script:StateMarker -Value 'schema=1' -Encoding ASCII
+}
+
+function Remove-InstallerState {
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+    if (-not (Test-Path -LiteralPath $script:StateDir)) { return }
+    Assert-SafeStateDirectory
+    if (-not (Test-Path -LiteralPath $script:StateMarker -PathType Leaf)) {
+        Write-WarnMsg "Preserving unmarked installer state directory: $script:StateDir"
+        return
+    }
+
+    foreach ($knownPath in @($script:VersionFile, $script:StateMarker, $script:DownloadDir)) {
+        if (Test-Path -LiteralPath $knownPath) {
+            $knownItem = Get-Item -LiteralPath $knownPath -Force
+            if (($knownItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Refusing to clean installer state because a known path is a reparse point: $knownPath"
+            }
+        }
+    }
+    if ((Test-Path -LiteralPath $script:VersionFile) -and
+        -not (Test-Path -LiteralPath $script:VersionFile -PathType Leaf)) {
+        throw "Refusing to clean unexpected installer version state: $script:VersionFile"
+    }
+    if ((Test-Path -LiteralPath $script:DownloadDir) -and
+        -not (Test-Path -LiteralPath $script:DownloadDir -PathType Container)) {
+        throw "Refusing to clean unexpected installer downloads state: $script:DownloadDir"
+    }
+
+    if (Test-Path -LiteralPath $script:DownloadDir) {
+        if (-not (Get-ChildItem -LiteralPath $script:DownloadDir -Force | Select-Object -First 1)) {
+            if ($PSCmdlet.ShouldProcess($script:DownloadDir, 'Remove empty installer download directory')) {
+                Remove-Item -LiteralPath $script:DownloadDir -Force
+            }
+        }
+    }
+
+    foreach ($knownFile in @($script:VersionFile, $script:StateMarker)) {
+        if (Test-Path -LiteralPath $knownFile -PathType Leaf) {
+            if ($PSCmdlet.ShouldProcess($knownFile, 'Remove managed installer state file')) {
+                Remove-Item -LiteralPath $knownFile -Force
+            }
+        }
+    }
+
+    if (-not (Get-ChildItem -LiteralPath $script:StateDir -Force | Select-Object -First 1)) {
+        if ($PSCmdlet.ShouldProcess($script:StateDir, 'Remove empty installer state directory')) {
+            Remove-Item -LiteralPath $script:StateDir -Force
+        }
+    }
 }
 
 # ===============================
 # DISCOVERY (install / uninstall)
 # ===============================
-function Get-LmStudioRegistryEntry {
+function Get-LmStudioRegistryRecord {
     $uninstallRoots = @(
         'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
         'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
@@ -271,13 +349,12 @@ function Get-LmStudioRegistryEntry {
                 $displayName = [string]$entry.DisplayName
                 if ($displayName -match '^LM Studio(?:\s|$)' -and
                     [string]$entry.Publisher -eq 'LM Studio') {
-                    return $entry
+                    Write-Output $entry
                 }
             }
             catch { Write-Verbose "Could not inspect registry entry $($key.PSPath): $($_.Exception.Message)" }
         }
     }
-    return $null
 }
 
 function Get-ObjectPropertyValue {
@@ -290,25 +367,85 @@ function Get-ObjectPropertyValue {
     return $null
 }
 
-function Get-LmStudioInstallPath {
-    foreach ($root in $script:KnownInstallRoots) {
-        $exe = Join-Path $root 'LM Studio.exe'
-        if (Test-Path -LiteralPath $exe) { return $root }
+function ConvertTo-NormalizedPath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+    try {
+        return [IO.Path]::GetFullPath($Path).TrimEnd([char[]]@('\', '/'))
+    }
+    catch { return $null }
+}
+
+function Get-RegistryEntryInstallPath {
+    param([Parameter(Mandatory)]$Entry)
+    $paths = @()
+    $installLocation = Get-ObjectPropertyValue -InputObject $Entry -Name 'InstallLocation'
+    if ($installLocation) { $paths += [string]$installLocation }
+    foreach ($propertyName in @('QuietUninstallString', 'UninstallString')) {
+        $command = Get-ObjectPropertyValue -InputObject $Entry -Name $propertyName
+        if (-not $command) { continue }
+        try {
+            $parts = Split-UninstallCommand -Command ([string]$command)
+            $paths += Split-Path -Parent $parts.Exe
+        }
+        catch { Write-Verbose "Could not derive install path from $propertyName" }
+    }
+    return @($paths | Where-Object { $_ } | Select-Object -Unique)
+}
+
+function Get-LmStudioRegistryEntry {
+    param([string]$InstallPath)
+    $entries = @(Get-LmStudioRegistryRecord)
+    if (-not $InstallPath) {
+        if ($entries.Count -gt 1) {
+            throw 'Multiple LM Studio registry entries were found; refusing ambiguous discovery.'
+        }
+        if ($entries.Count -eq 1) { return $entries[0] }
+        return $null
     }
 
-    $entry = Get-LmStudioRegistryEntry
-    $installLocation = if ($entry) { Get-ObjectPropertyValue -InputObject $entry -Name 'InstallLocation' } else { $null }
-    if ($installLocation) {
-        $registryExe = Join-Path ([string]$installLocation) 'LM Studio.exe'
-        if (Test-Path -LiteralPath $registryExe) {
-            return [string]$installLocation
+    $normalizedInstallPath = ConvertTo-NormalizedPath -Path $InstallPath
+    $matchingEntries = @($entries | Where-Object {
+        $entry = $_
+        @(Get-RegistryEntryInstallPath -Entry $entry | Where-Object {
+            (ConvertTo-NormalizedPath -Path $_) -ieq $normalizedInstallPath
+        }).Count -gt 0
+    })
+    if ($matchingEntries.Count -gt 1) {
+        throw "Multiple registry entries match the live LM Studio path: $InstallPath"
+    }
+    if ($matchingEntries.Count -eq 1) { return $matchingEntries[0] }
+    return $null
+}
+
+function Get-LmStudioInstallPath {
+    $candidates = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($root in $script:KnownInstallRoots) {
+        $exe = Join-Path $root 'LM Studio.exe'
+        if (Test-Path -LiteralPath $exe) { $candidates.Add($root) }
+    }
+
+    foreach ($entry in @(Get-LmStudioRegistryRecord)) {
+        foreach ($registryPath in @(Get-RegistryEntryInstallPath -Entry $entry)) {
+            $registryExe = Join-Path $registryPath 'LM Studio.exe'
+            if (Test-Path -LiteralPath $registryExe) {
+                $candidates.Add($registryPath)
+            }
         }
     }
+
+    $unique = @($candidates | ForEach-Object { ConvertTo-NormalizedPath -Path $_ } |
+        Where-Object { $_ } | Sort-Object -Unique)
+    if ($unique.Count -gt 1) {
+        throw "Multiple live LM Studio installations were found: $($unique -join ', ')"
+    }
+    if ($unique.Count -eq 1) { return $unique[0] }
     return $null
 }
 
 function Get-LmStudioUninstallCommand {
-    $entry = Get-LmStudioRegistryEntry
+    param([string]$InstallPath)
+    $entry = Get-LmStudioRegistryEntry -InstallPath $InstallPath
     if (-not $entry) { return $null }
     $quietCommand = Get-ObjectPropertyValue -InputObject $entry -Name 'QuietUninstallString'
     if ($quietCommand) { return [string]$quietCommand }
@@ -339,7 +476,7 @@ function Get-LmStudioState {
         }
     }
 
-    $entry = Get-LmStudioRegistryEntry
+    $entry = Get-LmStudioRegistryEntry -InstallPath $path
     $detectedVersion = if ($entry) {
         $displayVersion = Get-ObjectPropertyValue -InputObject $entry -Name 'DisplayVersion'
         ConvertTo-LmStudioVersion -Value ([string]$displayVersion)
@@ -409,6 +546,7 @@ function Invoke-FileDownload {
         [Parameter(Mandatory)][string]$Url,
         [Parameter(Mandatory)][string]$Destination
     )
+    Initialize-InstallerState
     $dir = Split-Path -Parent $Destination
     if (-not (Test-Path -LiteralPath $dir)) {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
@@ -554,10 +692,34 @@ function Install-LmStudio {
         throw "Installer exited with code $($proc.ExitCode)"
     }
 
-    $installPath = Get-LmStudioInstallPath
-    $installedExe = if ($installPath) { Join-Path $installPath 'LM Studio.exe' } else { $null }
+    $installPath = $null
+    $installedExe = $null
+    $detectedVersion = $null
+    for ($attempt = 1; $attempt -le 10; $attempt++) {
+        $installPath = Get-LmStudioInstallPath
+        $installedExe = if ($installPath) { Join-Path $installPath 'LM Studio.exe' } else { $null }
+        if ($installedExe -and (Test-Path -LiteralPath $installedExe)) {
+            $detectedVersion = Get-ExeFileVersion -ExePath $installedExe
+            if ($detectedVersion -and
+                (ConvertTo-VersionObject -Value $detectedVersion).CompareTo(
+                    (ConvertTo-VersionObject -Value $Ver)
+                ) -eq 0) {
+                break
+            }
+        }
+        if ($attempt -lt 10) { Start-Sleep -Milliseconds 250 }
+    }
+
     if (-not $installedExe -or -not (Test-Path -LiteralPath $installedExe)) {
         throw 'Installer exited successfully but LM Studio.exe was not found.'
+    }
+    if (-not $detectedVersion) {
+        throw "Installer exited successfully, but the installed LM Studio version could not be verified (expected version $Ver)."
+    }
+    if ((ConvertTo-VersionObject -Value $detectedVersion).CompareTo(
+            (ConvertTo-VersionObject -Value $Ver)
+        ) -ne 0) {
+        throw "Installer exited successfully, but expected version $Ver and found $detectedVersion."
     }
 
     Set-RecordedVersion -Ver $Ver
@@ -566,16 +728,18 @@ function Install-LmStudio {
 }
 
 function Invoke-Uninstall {
-    $uninstall = Get-LmStudioUninstallCommand
     $installPath = Get-LmStudioInstallPath
     $recorded = Get-RecordedVersion
 
-    if (-not $uninstall -and $installPath) {
-        throw 'LM Studio is present, but no valid registry uninstaller was found. Use Windows Apps settings or the vendor uninstaller; no files were removed.'
-    }
-    if (-not $uninstall) {
+    if (-not $installPath) {
         Write-WarnMsg "LM Studio does not appear to be installed."
         return
+    }
+
+    $uninstall = Get-LmStudioUninstallCommand -InstallPath $installPath
+
+    if (-not $uninstall) {
+        throw 'LM Studio is present, but no valid registry uninstaller was found. Use Windows Apps settings or the vendor uninstaller; no files were removed.'
     }
 
     Write-Host ""
@@ -615,9 +779,7 @@ function Invoke-Uninstall {
         }
     }
 
-    if (Test-Path -LiteralPath $script:StateDir) {
-        Remove-Item -LiteralPath $script:StateDir -Recurse -Force
-    }
+    Remove-InstallerState
     Write-Ok "LM Studio uninstalled."
 }
 
@@ -671,6 +833,8 @@ function Show-Check {
     }
     else {
         Write-Host "  Latest:    (could not fetch - check https://lmstudio.ai/download)" -ForegroundColor Yellow
+        Write-Host ""
+        throw 'Could not determine latest LM Studio version.'
     }
     Write-Host ""
 }
@@ -747,6 +911,9 @@ function Invoke-Main {
         else {
             Write-WarnMsg "Could not auto-detect latest version."
             Write-Info "Check https://lmstudio.ai/download for the current release."
+            if ($script:NonInteractive) {
+                throw 'Could not determine a version in non-interactive mode; specify -Version.'
+            }
             $target = Read-Host "Enter the exact version to install (e.g. 0.4.20-1)"
             if ([string]::IsNullOrWhiteSpace($target)) {
                 throw "No version entered."
