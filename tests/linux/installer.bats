@@ -120,13 +120,27 @@ make_managed_install() {
 @test "install refuses to overwrite a foreign desktop entry" {
     make_managed_install
     mkdir -p "$DESKTOP_DIR"
-    printf foreign > "$DESKTOP_DIR/lm-studio.desktop"
+    printf foreign > "$DESKTOP_DIR/ai.elementlabs.lmstudio.desktop"
 
     run bash -c 'source "$1"; trap - EXIT INT TERM; create_desktop_entry' _ \
         "$PROJECT_ROOT/lm-studio-install.sh"
 
     [ "$status" -eq 1 ]
+    [ "$(cat "$DESKTOP_DIR/ai.elementlabs.lmstudio.desktop")" = foreign ]
+}
+
+@test "install preserves a foreign legacy desktop entry" {
+    make_managed_install
+    mkdir -p "$DESKTOP_DIR"
+    printf foreign > "$DESKTOP_DIR/lm-studio.desktop"
+
+    run bash -c 'source "$1"; trap - EXIT INT TERM; create_desktop_entry' _ \
+        "$PROJECT_ROOT/lm-studio-install.sh"
+
+    [ "$status" -eq 0 ]
     [ "$(cat "$DESKTOP_DIR/lm-studio.desktop")" = foreign ]
+    grep -Fqx 'StartupWMClass=ai.elementlabs.lmstudio' \
+        "$DESKTOP_DIR/ai.elementlabs.lmstudio.desktop"
 }
 
 @test "uninstall preserves foreign integration files" {
@@ -135,6 +149,7 @@ make_managed_install() {
     printf foreign-launcher > "$BIN_DIR/lm-studio"
     printf foreign-cli > "$BIN_DIR/lms"
     printf foreign-desktop > "$DESKTOP_DIR/lm-studio.desktop"
+    printf foreign-canonical > "$DESKTOP_DIR/ai.elementlabs.lmstudio.desktop"
     run bash -c 'source "$1"; trap - EXIT INT TERM; OPT_YES=true; cmd_uninstall' _ \
         "$PROJECT_ROOT/lm-studio-install.sh"
 
@@ -142,6 +157,7 @@ make_managed_install() {
     [ "$(cat "$BIN_DIR/lm-studio")" = foreign-launcher ]
     [ "$(cat "$BIN_DIR/lms")" = foreign-cli ]
     [ "$(cat "$DESKTOP_DIR/lm-studio.desktop")" = foreign-desktop ]
+    [ "$(cat "$DESKTOP_DIR/ai.elementlabs.lmstudio.desktop")" = foreign-canonical ]
 }
 
 @test "uninstall removes an installer-managed backup" {
@@ -513,6 +529,7 @@ EOF
     [ "$status" -eq 8 ]
     [ "$(cat "$INSTALL_DIR/.installed_version")" = 1.0.0 ]
     cmp -s "$TEST_ROOT/desktop-before" "$DESKTOP_DIR/lm-studio.desktop"
+    [ ! -e "$DESKTOP_DIR/ai.elementlabs.lmstudio.desktop" ]
     [ ! -L "$BIN_DIR/lm-studio" ]
     [ ! -L "$BIN_DIR/lms" ]
 }
@@ -574,6 +591,69 @@ EOF
     [[ "$output" == *"currently running"* ]]
     [ -d "$INSTALL_DIR" ]
     [ "$(cat "$INSTALL_DIR/.installed_version")" = 1.0.0 ]
+}
+
+@test "desktop entry uses the bundled Wayland app id" {
+    make_managed_install
+    mkdir -p "$INSTALL_DIR/usr/share/icons/hicolor/512x512/apps"
+    printf 'png' > "$INSTALL_DIR/usr/share/icons/hicolor/512x512/apps/lm-studio.png"
+    printf '%s\n' \
+        '[Desktop Entry]' \
+        'Name=LM-Studio' \
+        'Icon=lm-studio' \
+        'StartupWMClass=ai.elementlabs.lmstudio' \
+        > "$INSTALL_DIR/ai.elementlabs.lmstudio.desktop"
+
+    run bash -c 'source "$1"; trap - EXIT INT TERM; create_desktop_entry' _ \
+        "$PROJECT_ROOT/lm-studio-install.sh"
+
+    [ "$status" -eq 0 ]
+    [ -f "$DESKTOP_DIR/ai.elementlabs.lmstudio.desktop" ]
+    [ ! -e "$DESKTOP_DIR/lm-studio.desktop" ]
+    grep -Fqx 'StartupWMClass=ai.elementlabs.lmstudio' \
+        "$DESKTOP_DIR/ai.elementlabs.lmstudio.desktop"
+    grep -Fqx 'X-LMStudio-Installer-Managed=true' \
+        "$DESKTOP_DIR/ai.elementlabs.lmstudio.desktop"
+    [ -L "$HOME/.local/share/icons/hicolor/512x512/apps/ai.elementlabs.lmstudio.png" ]
+    [ -L "$HOME/.local/share/icons/hicolor/512x512/apps/lm-studio.png" ]
+}
+
+@test "desktop entry replaces an owned legacy lm-studio.desktop file" {
+    make_managed_install
+    mkdir -p "$DESKTOP_DIR"
+    printf '[Desktop Entry]\nName=Old LM Studio\nX-LMStudio-Installer-Managed=true\n' > \
+        "$DESKTOP_DIR/lm-studio.desktop"
+
+    run bash -c 'source "$1"; trap - EXIT INT TERM; create_desktop_entry' _ \
+        "$PROJECT_ROOT/lm-studio-install.sh"
+
+    [ "$status" -eq 0 ]
+    [ -f "$DESKTOP_DIR/ai.elementlabs.lmstudio.desktop" ]
+    [ ! -e "$DESKTOP_DIR/lm-studio.desktop" ]
+}
+
+@test "uninstall removes managed desktop files and icon links" {
+    make_managed_install
+    mkdir -p "$DESKTOP_DIR" "$INSTALL_DIR/usr/share/icons/hicolor/48x48/apps" \
+        "$HOME/.local/share/icons/hicolor/48x48/apps"
+    printf '[Desktop Entry]\nName=LM Studio\nX-LMStudio-Installer-Managed=true\n' > \
+        "$DESKTOP_DIR/ai.elementlabs.lmstudio.desktop"
+    printf '[Desktop Entry]\nName=Old LM Studio\nX-LMStudio-Installer-Managed=true\n' > \
+        "$DESKTOP_DIR/lm-studio.desktop"
+    printf 'png' > "$INSTALL_DIR/usr/share/icons/hicolor/48x48/apps/lm-studio.png"
+    ln -s "$INSTALL_DIR/usr/share/icons/hicolor/48x48/apps/lm-studio.png" \
+        "$HOME/.local/share/icons/hicolor/48x48/apps/lm-studio.png"
+    ln -s "$INSTALL_DIR/usr/share/icons/hicolor/48x48/apps/lm-studio.png" \
+        "$HOME/.local/share/icons/hicolor/48x48/apps/ai.elementlabs.lmstudio.png"
+
+    run bash -c 'source "$1"; trap - EXIT INT TERM; OPT_YES=true; cmd_uninstall' _ \
+        "$PROJECT_ROOT/lm-studio-install.sh"
+
+    [ "$status" -eq 0 ]
+    [ ! -e "$DESKTOP_DIR/ai.elementlabs.lmstudio.desktop" ]
+    [ ! -e "$DESKTOP_DIR/lm-studio.desktop" ]
+    [ ! -e "$HOME/.local/share/icons/hicolor/48x48/apps/lm-studio.png" ]
+    [ ! -e "$HOME/.local/share/icons/hicolor/48x48/apps/ai.elementlabs.lmstudio.png" ]
 }
 
 @test "rollback reports an integration restore failure" {

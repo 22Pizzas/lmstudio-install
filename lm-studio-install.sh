@@ -90,10 +90,16 @@ set -euo pipefail
 readonly INSTALL_DIR="${LMS_INSTALL_DIR:-${HOME}/.local/share/lm-studio}"
 readonly BIN_DIR="${HOME}/.local/bin"
 readonly DESKTOP_DIR="${HOME}/.local/share/applications"
+readonly ICON_THEME_DIR="${HOME}/.local/share/icons/hicolor"
 readonly VERSION_FILE="${INSTALL_DIR}/.installed_version"
 readonly MANAGED_MARKER="${INSTALL_DIR}/.lmstudio-installer-managed"
 readonly BACKUP_DIR="${INSTALL_DIR}.bak"
 readonly DESKTOP_MARKER='X-LMStudio-Installer-Managed=true'
+# Wayland/KDE match windows by app id, which LM Studio sets to this
+# reverse-DNS class (see the AppImage's bundled .desktop file).
+readonly DEFAULT_DESKTOP_APP_ID='ai.elementlabs.lmstudio'
+readonly LEGACY_DESKTOP_ID='lm-studio'
+readonly ICON_SIZES=(16x16 24x24 32x32 48x48 64x64 128x128 256x256 512x512)
 
 # Minimum expected AppImage size (bytes). Real builds are hundreds of MB;
 # this guards against truncated downloads that still pass ELF magic checks.
@@ -131,7 +137,7 @@ LM_STUDIO_LINK_TARGET=""
 LMS_LINK_WAS_PRESENT=false
 LMS_LINK_TARGET=""
 DESKTOP_WAS_PRESENT=false
-DESKTOP_BACKUP_FILE=""
+DESKTOP_BACKUP_DIR=""
 
 # temp_track() — Add a path to the cleanup list
 temp_track() { TEMP_FILES+=("$1"); }
@@ -172,7 +178,8 @@ cleanup() {
             # files carrying our ownership markers before removing the app.
             remove_owned_link "${BIN_DIR}/lm-studio" "${INSTALL_DIR}/lm-studio" 2>/dev/null || true
             remove_owned_link "${BIN_DIR}/lms" "${INSTALL_DIR}/lms" 2>/dev/null || true
-            remove_owned_desktop_entry "${DESKTOP_DIR}/lm-studio.desktop" 2>/dev/null || true
+            remove_managed_desktop_entries 2>/dev/null || true
+            remove_icon_theme_links "$(desktop_app_id)" 2>/dev/null || true
             rm -rf -- "${INSTALL_DIR:?}" 2>/dev/null || true
         fi
     fi
@@ -366,6 +373,109 @@ remove_owned_desktop_entry() {
     fi
 }
 
+# LM Studio's Wayland app id is the reverse-DNS StartupWMClass from the
+# bundled AppImage desktop file, not the "lm-studio" executable name.
+desktop_app_id() {
+    local bundled="" wm_class="" base=""
+    bundled="${INSTALL_DIR}/${DEFAULT_DESKTOP_APP_ID}.desktop"
+    if [[ ! -f "$bundled" ]]; then
+        bundled=$(find "$INSTALL_DIR" -maxdepth 1 -name '*.desktop' -type f \
+                      2>/dev/null | head -1)
+    fi
+    if [[ -n "$bundled" && -f "$bundled" ]]; then
+        wm_class=$(awk -F= '/^StartupWMClass=/ {print $2; exit}' "$bundled" | tr -d '\r')
+        if [[ -n "$wm_class" ]]; then
+            printf '%s\n' "$wm_class"
+            return 0
+        fi
+        base=$(basename -- "$bundled" .desktop)
+        if [[ -n "$base" && "$base" != "$LEGACY_DESKTOP_ID" ]]; then
+            printf '%s\n' "$base"
+            return 0
+        fi
+    fi
+    printf '%s\n' "$DEFAULT_DESKTOP_APP_ID"
+}
+
+managed_desktop_paths() {
+    local app_id="${1:-$(desktop_app_id)}"
+    printf '%s\n' "${DESKTOP_DIR}/${app_id}.desktop"
+    if [[ "$app_id" != "$LEGACY_DESKTOP_ID" ]]; then
+        printf '%s\n' "${DESKTOP_DIR}/${LEGACY_DESKTOP_ID}.desktop"
+    fi
+    if [[ "$app_id" != "$DEFAULT_DESKTOP_APP_ID" ]]; then
+        printf '%s\n' "${DESKTOP_DIR}/${DEFAULT_DESKTOP_APP_ID}.desktop"
+    fi
+}
+
+remove_managed_desktop_entries() {
+    local desktop_path
+    while IFS= read -r desktop_path; do
+        [[ -n "$desktop_path" ]] || continue
+        remove_owned_desktop_entry "$desktop_path"
+    done < <(managed_desktop_paths "$@")
+}
+
+refresh_desktop_database() {
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+    fi
+}
+
+refresh_icon_cache() {
+    if command -v gtk-update-icon-cache >/dev/null 2>&1 && [[ -d "$ICON_THEME_DIR" ]]; then
+        gtk-update-icon-cache -f -t "$ICON_THEME_DIR" 2>/dev/null || true
+    fi
+}
+
+icon_source_png() {
+    printf '%s\n' "${INSTALL_DIR}/usr/share/icons/hicolor/${1}/apps/lm-studio.png"
+}
+
+install_icon_theme_links() {
+    local app_id="$1"
+    local size src dest dest_dir name
+    local -a names=("$LEGACY_DESKTOP_ID")
+    if [[ "$app_id" != "$LEGACY_DESKTOP_ID" ]]; then
+        names+=("$app_id")
+    fi
+    for size in "${ICON_SIZES[@]}"; do
+        src=$(icon_source_png "$size")
+        [[ -f "$src" ]] || continue
+        dest_dir="${ICON_THEME_DIR}/${size}/apps"
+        mkdir -p "$dest_dir" || continue
+        for name in "${names[@]}"; do
+            dest="${dest_dir}/${name}.png"
+            if [[ -e "$dest" || -L "$dest" ]]; then
+                if link_points_to "$dest" "$src"; then
+                    continue
+                fi
+                log_warn "Preserving icon not managed by this script: $dest"
+                continue
+            fi
+            ln -sfn -- "$src" "$dest"
+        done
+    done
+    refresh_icon_cache
+}
+
+remove_icon_theme_links() {
+    local app_id="$1"
+    local size src dest name
+    local -a names=("$LEGACY_DESKTOP_ID")
+    if [[ "$app_id" != "$LEGACY_DESKTOP_ID" ]]; then
+        names+=("$app_id")
+    fi
+    for size in "${ICON_SIZES[@]}"; do
+        src=$(icon_source_png "$size")
+        for name in "${names[@]}"; do
+            dest="${ICON_THEME_DIR}/${size}/apps/${name}.png"
+            remove_owned_link "$dest" "$src"
+        done
+    done
+    refresh_icon_cache
+}
+
 remove_owned_backup() {
     if [[ ! -e "$BACKUP_DIR" && ! -L "$BACKUP_DIR" ]]; then
         return 0
@@ -488,13 +598,16 @@ snapshot_integration_state() {
         LMS_LINK_TARGET=$(readlink -- "${BIN_DIR}/lms")
     fi
 
-    local desktop_path="${DESKTOP_DIR}/lm-studio.desktop"
-    if desktop_entry_is_owned "$desktop_path"; then
-        DESKTOP_BACKUP_FILE=$(mktemp "${TMPDIR:-/tmp}/lm-studio.desktop.XXXXXX")
-        temp_track "$DESKTOP_BACKUP_FILE"
-        cp -p -- "$desktop_path" "$DESKTOP_BACKUP_FILE"
-        DESKTOP_WAS_PRESENT=true
-    fi
+    DESKTOP_BACKUP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/lm-studio-desktop.XXXXXX")
+    temp_track "$DESKTOP_BACKUP_DIR"
+    local desktop_path
+    while IFS= read -r desktop_path; do
+        [[ -n "$desktop_path" ]] || continue
+        if desktop_entry_is_owned "$desktop_path"; then
+            cp -p -- "$desktop_path" "${DESKTOP_BACKUP_DIR}/$(basename -- "$desktop_path")"
+            DESKTOP_WAS_PRESENT=true
+        fi
+    done < <(managed_desktop_paths)
     INTEGRATION_SNAPSHOTTED=true
 }
 
@@ -513,16 +626,20 @@ restore_integration_state() {
         remove_owned_link "${BIN_DIR}/lms" "${INSTALL_DIR}/lms" || return 1
     fi
 
-    local desktop_path="${DESKTOP_DIR}/lm-studio.desktop"
-    if [[ "$DESKTOP_WAS_PRESENT" == true && -f "$DESKTOP_BACKUP_FILE" ]]; then
-        mkdir -p "$DESKTOP_DIR" || return 1
-        cp -p -- "$DESKTOP_BACKUP_FILE" "$desktop_path" || return 1
-    else
+    local desktop_path backup_file
+    while IFS= read -r desktop_path; do
+        [[ -n "$desktop_path" ]] || continue
         remove_owned_desktop_entry "$desktop_path" || return 1
+    done < <(managed_desktop_paths)
+
+    if [[ "$DESKTOP_WAS_PRESENT" == true && -d "$DESKTOP_BACKUP_DIR" ]]; then
+        mkdir -p "$DESKTOP_DIR" || return 1
+        for backup_file in "$DESKTOP_BACKUP_DIR"/*.desktop; do
+            [[ -f "$backup_file" ]] || continue
+            cp -p -- "$backup_file" "${DESKTOP_DIR}/$(basename -- "$backup_file")" || return 1
+        done
     fi
-    if command -v update-desktop-database >/dev/null 2>&1; then
-        update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
-    fi
+    refresh_desktop_database
     return 0
 }
 
@@ -537,7 +654,7 @@ cmd_info() {
         echo -e "  ${GREEN}Install directory:${NC} $INSTALL_DIR"
         echo -e "  ${GREEN}Launcher symlink: ${NC} ${BIN_DIR}/lm-studio"
         [[ -L "${BIN_DIR}/lms" ]] && echo -e "  ${GREEN}CLI symlink:      ${NC} ${BIN_DIR}/lms"
-        echo -e "  ${GREEN}Desktop entry:    ${NC} ${DESKTOP_DIR}/lm-studio.desktop"
+        echo -e "  ${GREEN}Desktop entry:    ${NC} ${DESKTOP_DIR}/$(desktop_app_id).desktop"
         warn_if_lm_studio_running
     else
         echo -e "  ${YELLOW}LM Studio does not appear to be installed.${NC}"
@@ -565,14 +682,15 @@ cmd_uninstall() {
 
     # Check link ownership while their targets still exist, then remove only
     # integration files that this installer created.
+    local app_id
+    app_id=$(desktop_app_id)
     remove_owned_link "${BIN_DIR}/lm-studio" "${INSTALL_DIR}/lm-studio"
     remove_owned_link "${BIN_DIR}/lms" "${INSTALL_DIR}/lms"
-    remove_owned_desktop_entry "${DESKTOP_DIR}/lm-studio.desktop"
+    remove_managed_desktop_entries "$app_id"
+    remove_icon_theme_links "$app_id"
     remove_owned_backup
     rm -rf "${INSTALL_DIR:?}"
-    if command -v update-desktop-database >/dev/null 2>&1; then
-        update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
-    fi
+    refresh_desktop_database
 
     log_success "LM Studio uninstalled."
 }
@@ -1075,7 +1193,9 @@ create_symlinks() {
 create_desktop_entry() {
     log_info "Creating desktop entry..."
     mkdir -p "$DESKTOP_DIR"
-    local desktop_path="${DESKTOP_DIR}/lm-studio.desktop"
+    local app_id desktop_path legacy_path
+    app_id=$(desktop_app_id)
+    desktop_path="${DESKTOP_DIR}/${app_id}.desktop"
     ensure_owned_desktop_slot "$desktop_path"
 
     # FIX: Limit icon search depth to avoid slow traversal on large installs.
@@ -1087,7 +1207,7 @@ create_desktop_entry() {
     [[ -n "$icon_path" ]] || icon_path="lm-studio"
 
     local staged_desktop
-    staged_desktop=$(mktemp "${DESKTOP_DIR}/.lm-studio.desktop.XXXXXX")
+    staged_desktop=$(mktemp "${DESKTOP_DIR}/.${app_id}.desktop.XXXXXX")
     temp_track "$staged_desktop"
     cat > "$staged_desktop" <<EOF
 [Desktop Entry]
@@ -1099,7 +1219,7 @@ Exec=${BIN_DIR}/lm-studio
 Icon=${icon_path}
 Terminal=false
 Categories=Development;Science;
-StartupWMClass=lm-studio
+StartupWMClass=${app_id}
 Keywords=AI;LLM;Machine Learning;
 ${DESKTOP_MARKER}
 EOF
@@ -1107,9 +1227,14 @@ EOF
     chmod +x "$staged_desktop"
     mv -f -- "$staged_desktop" "$desktop_path"
     temp_untrack "$staged_desktop"
-    if command -v update-desktop-database >/dev/null 2>&1; then
-        update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+
+    legacy_path="${DESKTOP_DIR}/${LEGACY_DESKTOP_ID}.desktop"
+    if [[ "$desktop_path" != "$legacy_path" ]]; then
+        remove_owned_desktop_entry "$legacy_path"
     fi
+
+    install_icon_theme_links "$app_id"
+    refresh_desktop_database
     log_success "Desktop entry created"
 }
 
