@@ -64,6 +64,11 @@
 #      export PATH="$HOME/.local/bin:$PATH"
 #      Then: source ~/.bashrc
 #
+#   Q: After an update the app still shows the old version
+#   A: An already-open LM Studio window is still the previous process.
+#      Quit it fully (not just close a window) and launch lm-studio again.
+#      This installer now refuses to replace files while the app is running.
+#
 #   Q: Installation failed, how do I recover?
 #   A: The script creates automatic backups in ~/.local/share/lm-studio.bak
 #      Restore manually:
@@ -372,6 +377,105 @@ remove_owned_backup() {
     fi
 }
 
+# True when /proc exe is this install's lm-studio binary, including an
+# unlinked " (deleted)" copy left if the app was replaced while running.
+is_lm_studio_process_exe() {
+    local exe_path="$1"
+    [[ -n "$exe_path" ]] || return 1
+    local install_exe="${INSTALL_DIR}/lm-studio"
+    local bin_exe="${BIN_DIR}/lm-studio"
+    [[ "$exe_path" == "$install_exe" || "$exe_path" == "$bin_exe" ]] && return 0
+
+    local resolved
+    resolved=$(readlink -f -- "$install_exe" 2>/dev/null) || true
+    [[ -n "$resolved" && "$exe_path" == "$resolved" ]] && return 0
+    resolved=$(readlink -f -- "$bin_exe" 2>/dev/null) || true
+    [[ -n "$resolved" && "$exe_path" == "$resolved" ]] && return 0
+    return 1
+}
+
+list_running_lm_studio_pids() {
+    local pid_dir pid exe exe_path lock lock_target lock_pid
+    local -A seen=()
+
+    for pid_dir in /proc/[0-9]*; do
+        pid="${pid_dir#/proc/}"
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        exe=$(readlink -- "$pid_dir/exe" 2>/dev/null) || continue
+        exe_path="${exe% (deleted)}"
+        if is_lm_studio_process_exe "$exe_path"; then
+            seen["$pid"]=1
+        fi
+    done
+
+    lock="${HOME}/.config/LM Studio/SingletonLock"
+    if [[ -L "$lock" ]]; then
+        lock_target=$(readlink -- "$lock" 2>/dev/null) || true
+        lock_pid="${lock_target##*-}"
+        if [[ "$lock_pid" =~ ^[0-9]+$ && -d "/proc/${lock_pid}" ]]; then
+            seen["$lock_pid"]=1
+        fi
+    fi
+
+    [[ ${#seen[@]} -gt 0 ]] || return 0
+    for pid in "${!seen[@]}"; do
+        printf '%s\n' "$pid"
+    done
+}
+
+format_running_lm_studio_pids() {
+    local -a all=() mains=()
+    local pid cmdline
+    while IFS= read -r pid; do
+        [[ -n "$pid" ]] && all+=("$pid")
+    done < <(list_running_lm_studio_pids)
+
+    [[ ${#all[@]} -eq 0 ]] && return 0
+
+    for pid in "${all[@]}"; do
+        cmdline=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null) || continue
+        if [[ "$cmdline" != *"--type="* ]]; then
+            mains+=("$pid")
+        fi
+    done
+    if [[ ${#mains[@]} -gt 0 ]]; then
+        printf '%s' "${mains[*]}"
+    else
+        printf '%s' "${all[*]}"
+    fi
+}
+
+warn_if_lm_studio_running() {
+    local pids
+    pids=$(format_running_lm_studio_pids)
+    [[ -n "$pids" ]] || return 0
+    log_warn "LM Studio is still running (PID ${pids})."
+    log_warn "That window can keep showing the previous version until you quit it fully and launch again."
+}
+
+ensure_lm_studio_not_running() {
+    local pids response
+    while true; do
+        pids=$(format_running_lm_studio_pids)
+        [[ -z "$pids" ]] && return 0
+
+        log_warn "LM Studio is currently running (PID ${pids})."
+        log_warn "Quit it completely — closing a window may leave it running in the tray."
+        log_warn "The open instance will keep showing the old version until you relaunch."
+
+        if $OPT_YES; then
+            log_error "Quit LM Studio and rerun this installer."
+            return 1
+        fi
+
+        read -rp "Press Enter once it has quit, or type no to cancel: " response
+        if [[ "$response" =~ ^[Nn]([Oo])?$ ]]; then
+            log_info "Cancelled."
+            exit 0
+        fi
+    done
+}
+
 snapshot_integration_state() {
     [[ "$INTEGRATION_SNAPSHOTTED" == false ]] || return 0
 
@@ -434,6 +538,7 @@ cmd_info() {
         echo -e "  ${GREEN}Launcher symlink: ${NC} ${BIN_DIR}/lm-studio"
         [[ -L "${BIN_DIR}/lms" ]] && echo -e "  ${GREEN}CLI symlink:      ${NC} ${BIN_DIR}/lms"
         echo -e "  ${GREEN}Desktop entry:    ${NC} ${DESKTOP_DIR}/lm-studio.desktop"
+        warn_if_lm_studio_running
     else
         echo -e "  ${YELLOW}LM Studio does not appear to be installed.${NC}"
     fi
@@ -455,6 +560,8 @@ cmd_uninstall() {
         read -rp "Are you sure? (yes/no): " response
         [[ "$response" =~ ^[Yy][Ee][Ss]$ ]] || { log_info "Cancelled."; exit 0; }
     fi
+
+    ensure_lm_studio_not_running || exit 1
 
     # Check link ownership while their targets still exist, then remove only
     # integration files that this installer created.
@@ -864,7 +971,19 @@ configure_chrome_sandbox() {
     local expected
     expected=$(stat -Lc '%d:%i' -- "$sandbox") || return 1
 
-    sudo bash -c '
+    # Kubuntu/KDE sessions often have pkexec but not passwordless sudo.
+    local -a runner=()
+    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        runner=(sudo)
+    elif command -v pkexec >/dev/null 2>&1; then
+        runner=(pkexec)
+    elif command -v sudo >/dev/null 2>&1; then
+        runner=(sudo)
+    else
+        return 1
+    fi
+
+    "${runner[@]}" bash -c '
         set -euo pipefail
         exec 9<"$1"
         [[ "$(stat -Lc "%d:%i" /proc/self/fd/9)" == "$2" ]] || exit 73
@@ -912,16 +1031,16 @@ extract_and_install() {
 
     local sandbox="${INSTALL_DIR}/chrome-sandbox"
     if [[ -f "$sandbox" ]]; then
-        if command -v sudo >/dev/null 2>&1; then
-            log_info "Configuring chrome-sandbox (requires sudo)..."
+        if command -v sudo >/dev/null 2>&1 || command -v pkexec >/dev/null 2>&1; then
+            log_info "Configuring chrome-sandbox (requires sudo or pkexec)..."
             if configure_chrome_sandbox "$sandbox"; then
                 log_success "chrome-sandbox configured (SUID root)"
             else
-                log_warn "Could not configure chrome-sandbox (sudo denied or failed)."
-                log_warn "Resolve sudo access and rerun this installer so the sandbox can be verified safely."
+                log_warn "Could not configure chrome-sandbox (sudo/pkexec denied or failed)."
+                log_warn "Resolve sudo/pkexec access and rerun this installer so the sandbox can be verified safely."
             fi
         else
-            log_warn "sudo not found — skipping chrome-sandbox SUID setup."
+            log_warn "sudo/pkexec not found — skipping chrome-sandbox SUID setup."
             log_warn "LM Studio may require: chrome-sandbox owned by root with mode 4755"
         fi
     fi
@@ -1042,6 +1161,7 @@ main() {
     log_success "Target version: $version"
 
     show_security_warning
+    ensure_lm_studio_not_running || exit 1
 
     prepare_existing_install "$version"
     download_appimage "$version" "$arch"
@@ -1065,6 +1185,7 @@ main() {
     echo "  Launch with:   lm-studio" >&2
     echo "  CLI tools:     lms --help" >&2
     echo "  Uninstall:     $(basename "$0") uninstall" >&2
+    warn_if_lm_studio_running
     echo "" >&2
 }
 

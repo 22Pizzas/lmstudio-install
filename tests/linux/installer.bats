@@ -15,7 +15,38 @@ setup() {
 
 teardown() {
     [[ "$TEST_ROOT" == /tmp/* ]] || return 1
+    local pid_dir exe
+    for pid_dir in /proc/[0-9]*; do
+        exe=$(readlink -- "$pid_dir/exe" 2>/dev/null) || continue
+        exe="${exe% (deleted)}"
+        if [[ "$exe" == "$TEST_ROOT/"* ]]; then
+            kill "${pid_dir#/proc/}" 2>/dev/null || true
+        fi
+    done
     rm -rf -- "$TEST_ROOT"
+}
+
+start_stub_lm_studio() {
+    command -v python3 >/dev/null 2>&1 || skip "python3 is required"
+    mkdir -p "$INSTALL_DIR"
+    cp "$(readlink -f -- "$(command -v python3)")" "$INSTALL_DIR/lm-studio"
+    chmod +x "$INSTALL_DIR/lm-studio"
+    # Must not run this function in command substitution: the stub is a
+    # background child and a subshell would wait for its 120s sleep.
+    "$INSTALL_DIR/lm-studio" -c 'import time; time.sleep(120)' &
+    STUB_PID=$!
+    local exe i
+    for i in $(seq 1 50); do
+        exe=$(readlink -- "/proc/${STUB_PID}/exe" 2>/dev/null) || true
+        exe="${exe% (deleted)}"
+        if [[ "$exe" == "$INSTALL_DIR/lm-studio" ]]; then
+            return 0
+        fi
+        sleep 0.05
+    done
+    kill "$STUB_PID" 2>/dev/null || true
+    echo "stub lm-studio process did not exec $INSTALL_DIR/lm-studio" >&2
+    return 1
 }
 
 make_managed_install() {
@@ -331,6 +362,10 @@ make_managed_install() {
     mkdir -p "$TEST_ROOT/mock-bin"
     cat > "$TEST_ROOT/mock-bin/sudo" <<'EOF'
 #!/usr/bin/env bash
+# Succeed passwordless checks so the installer uses this sudo, not pkexec.
+if [[ "$1" == -n && "$2" == true && $# -eq 2 ]]; then
+    exit 0
+fi
 args=("$@")
 args[$((${#args[@]} - 1))]='0:0'
 exec "${args[@]}"
@@ -480,6 +515,65 @@ EOF
     cmp -s "$TEST_ROOT/desktop-before" "$DESKTOP_DIR/lm-studio.desktop"
     [ ! -L "$BIN_DIR/lm-studio" ]
     [ ! -L "$BIN_DIR/lms" ]
+}
+
+@test "detects a running lm-studio process from the install binary" {
+    make_managed_install 1.0.0
+    start_stub_lm_studio
+
+    run bash -c '
+        source "$1"; trap - EXIT INT TERM
+        list_running_lm_studio_pids
+    ' _ "$PROJECT_ROOT/lm-studio-install.sh"
+
+    kill "$STUB_PID" 2>/dev/null || true
+    wait "$STUB_PID" 2>/dev/null || true
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"$STUB_PID"* ]]
+}
+
+@test "non-interactive install refuses to replace a running instance" {
+    make_managed_install 1.0.0
+    start_stub_lm_studio
+
+    run bash -c '
+        source "$1"
+        check_dependencies() { :; }
+        detect_architecture() { echo x64; }
+        show_security_warning() { :; }
+        download_appimage() { echo downloaded > "$TEST_ROOT/downloaded"; return 8; }
+        main -v 2.0.0 -y
+    ' _ "$PROJECT_ROOT/lm-studio-install.sh"
+
+    kill "$STUB_PID" 2>/dev/null || true
+    wait "$STUB_PID" 2>/dev/null || true
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"currently running"* ]]
+    [[ "$output" == *"Quit LM Studio and rerun"* ]]
+    [ "$(cat "$INSTALL_DIR/.installed_version")" = 1.0.0 ]
+    [ -x "$INSTALL_DIR/lm-studio" ]
+    [ ! -e "$TEST_ROOT/downloaded" ]
+}
+
+@test "non-interactive uninstall refuses while lm-studio is running" {
+    make_managed_install 1.0.0
+    start_stub_lm_studio
+
+    run bash -c '
+        source "$1"; trap - EXIT INT TERM
+        OPT_YES=true
+        cmd_uninstall
+    ' _ "$PROJECT_ROOT/lm-studio-install.sh"
+
+    kill "$STUB_PID" 2>/dev/null || true
+    wait "$STUB_PID" 2>/dev/null || true
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"currently running"* ]]
+    [ -d "$INSTALL_DIR" ]
+    [ "$(cat "$INSTALL_DIR/.installed_version")" = 1.0.0 ]
 }
 
 @test "rollback reports an integration restore failure" {
