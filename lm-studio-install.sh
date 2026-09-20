@@ -983,6 +983,8 @@ configure_chrome_sandbox() {
         return 1
     fi
 
+    # $1/$2 belong to the inner bash, not this script.
+    # shellcheck disable=SC2016
     "${runner[@]}" bash -c '
         set -euo pipefail
         exec 9<"$1"
